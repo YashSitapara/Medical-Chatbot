@@ -7,7 +7,14 @@ touch src/prompt.py
 touch .env
 touch setup.py
 touch app.py
+touch store_index.py
 touch research/trials.ipynb
 touch requirements.txt
 
-echo "Template created successfully"
+# Flask files.
+mkdir -p static
+mkdir -p templates
+touch static/style.css
+touch templates/chat.html
+
+echo "Template file run successfully."
