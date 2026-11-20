@@ -62,7 +62,8 @@ The API containers reach Ollama on your host at `host.docker.internal:11434`. Th
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Status, LLM provider/model, index name |
+| `GET` | `/health` | Status, LLM provider/model, index name (503 if chat memory is down) |
+| `GET` | `/ready` | Readiness: Redis ping + Pinecone index stats, each ≤ `READY_TIMEOUT_SECONDS` (5s). 200, or 503 naming the failed check |
 | `POST` | `/api/chat` | `{message, session_id?}` → `{session_id, answer, citations[]}` |
 | `POST` | `/api/chat/stream` | Same body, streamed back as SSE (see below) |
 | `GET` | `/api/sessions/{id}/history` | Messages in the session (404 if unknown or expired) |
@@ -158,6 +159,21 @@ If Redis is unreachable:
 - the API **refuses to start**;
 - while running, chat and history requests return **503** and `/health` returns 503, so load balancers and Docker take the instance out of rotation;
 - it recovers by itself when Redis comes back.
+
+### Health vs readiness
+
+- `GET /health`: the process is up and chat memory answers.
+- `GET /ready`: can this instance serve a chat right now? It runs a Redis `PING` and a Pinecone `describe_index_stats` call (no embedding, no query) **concurrently**, each limited to `READY_TIMEOUT_SECONDS` (default 5). It returns 200 when both pass, otherwise 503 with the failed check marked:
+
+  ```json
+  {"status": "not_ready", "checks": {
+    "redis":    {"ok": false, "latency_ms": 3.1,   "error": "MemoryUnavailableError"},
+    "pinecone": {"ok": true,  "latency_ms": 212.4, "error": null}}}
+  ```
+
+  `error` is only `timed out after Ns` or an exception class name; the full error is in the server log. With `MEMORY_BACKEND=memory` the first check is called `memory` and always passes.
+
+The Docker `HEALTHCHECK` calls `/ready`. Docker then **marks** the container `unhealthy` (see `docker compose ps`), but plain Compose doesn't restart it, and nginx keeps sending it traffic. Use `/ready` as the readiness probe in Swarm or Kubernetes, which do act on it.
 
 **Workers vs containers.** `WEB_CONCURRENCY` sets the uvicorn workers per container. Each worker loads its own copy of the embedding model, about 0.5 GB of RAM with torch, so add capacity with care.
 

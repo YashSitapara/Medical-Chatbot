@@ -1,0 +1,74 @@
+# Usage:
+#   docker compose up --build                  # 1 api replica behind nginx on :8000
+#   docker compose up --build --scale api=3    # 3 replicas sharing chat history via Redis
+#   docker compose run --rm ingest --recreate  # one-off indexing job
+#   docker compose up -d redis                 # just Redis, for running the app on your Mac
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]   # persist history across Redis restarts
+    volumes:
+      - redis-data:/data
+    ports:
+      # Lets uvicorn/pytest on your Mac use redis://localhost:6379. Bound to 127.0.0.1 so this
+      # password-less Redis is not reachable from your network. Containers keep using redis:6379.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: medical-rag:latest
+    env_file: .env
+    environment:
+      MEMORY_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      # Workers per container (uvicorn reads WEB_CONCURRENCY). Each loads its own embedding model.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      # Reach Ollama running on the host machine (macOS/Windows; Linux via host-gateway below).
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8000"          # not published: replicas are reached through nginx, so they can scale
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Healthcheck comes from the Dockerfile: GET /ready (Redis + Pinecone). `docker compose ps`
+    # shows "unhealthy" when either fails; it does not restart the container or reroute nginx.
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  ingest:
+    image: medical-rag:latest
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/srv/data:ro
+    entrypoint: ["python", "-m", "scripts.ingest"]
+    profiles: ["ingest"]
+
+  # Optional: run Ollama in a container instead of on the host.
+  # Then set OLLAMA_BASE_URL=http://ollama:11434 and `docker compose exec ollama ollama pull gemma3:4b`.
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports: ["11434:11434"]
+  #   volumes: ["ollama:/root/.ollama"]
+
+volumes:
+  redis-data:
+  # ollama:
