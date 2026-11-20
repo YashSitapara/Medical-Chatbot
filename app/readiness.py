@@ -6,15 +6,16 @@ quick 503 instead of a hung healthcheck.
 """
 
 import asyncio
-import logging
 import time
 from collections.abc import Awaitable, Callable
+
+import structlog
 
 from app.memory import ChatMemory
 from app.rag import RAGService
 from app.schemas import CheckResult, ReadyResponse
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 async def run_check(name: str, check: Callable[[], Awaitable[object]], timeout: float) -> CheckResult:
@@ -29,10 +30,10 @@ async def run_check(name: str, check: Callable[[], Awaitable[object]], timeout: 
         error = None
     except TimeoutError:
         error = f"timed out after {timeout:g}s"
-        logger.warning("Readiness check %s %s", name, error)
+        logger.warning("readiness_check_failed", check=name, error=error)
     except Exception as exc:
         error = type(exc).__name__
-        logger.warning("Readiness check %s failed: %r", name, exc)
+        logger.warning("readiness_check_failed", check=name, error=error, detail=repr(exc))
     latency_ms = round((time.perf_counter() - start) * 1000, 1)
     return CheckResult(ok=error is None, latency_ms=latency_ms, error=error)
 

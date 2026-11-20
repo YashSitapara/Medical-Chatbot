@@ -213,6 +213,11 @@
     }
   }
 
+  function withRef(error, requestId) {
+    if (requestId) error.requestId = requestId;
+    return error;
+  }
+
   async function send(message) {
     addMessage("user", message);
     const bot = addMessage("bot");
@@ -228,7 +233,8 @@
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(typeof err.detail === "string" ? err.detail : `Request failed (${res.status})`);
+        const msg = typeof err.detail === "string" ? err.detail : `Request failed (${res.status})`;
+        throw withRef(new Error(msg), res.headers.get("X-Request-ID"));
       }
       for await (const { event, data } of readSSE(res)) {
         if (event === "session") {
@@ -244,14 +250,16 @@
           renderAnswer(bot, data.answer, data.citations);
           renderSources(bot, data.citations);
         } else if (event === "error") {
-          throw new Error(data.detail);
+          throw withRef(new Error(data.detail), data.request_id);
         }
       }
     } catch (e) {
       body.textContent = text;
       const err = document.createElement("div");
       err.className = "error";
-      err.textContent = `⚠ ${e.message || "Something went wrong."}`;
+      // The reference matches request_id in the server logs.
+      const ref = e.requestId ? ` (ref: ${e.requestId.slice(0, 8)})` : "";
+      err.textContent = `⚠ ${e.message || "Something went wrong."}${ref}`;
       bot.appendChild(err);
     } finally {
       bot.classList.remove("pending");
