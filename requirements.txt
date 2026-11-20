@@ -7,6 +7,12 @@ pydantic-settings==2.15.0
 # --- Shared chat memory (MEMORY_BACKEND=redis) ---
 redis==8.1.0
 
+# --- Structured JSON logging ---
+structlog==26.1.0
+
+# --- Retries (Pinecone retrieval) ---
+tenacity==9.2.1
+
 # --- RAG / LangChain ---
 langchain-core==0.3.86
 langchain-community==0.3.26      # PyPDFLoader / DirectoryLoader
