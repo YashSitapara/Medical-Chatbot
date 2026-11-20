@@ -1,12 +1,22 @@
-langchain==0.3.26
-flask==3.1.1
+# --- Web API ---
+fastapi==0.164.0
+uvicorn[standard]==0.53.0
+pydantic==2.14.1
+pydantic-settings==2.15.0
+
+# --- Shared chat memory (MEMORY_BACKEND=redis) ---
+redis==8.1.0
+
+# --- RAG / LangChain ---
+langchain-core==0.3.86
+langchain-community==0.3.26      # PyPDFLoader / DirectoryLoader
+langchain-text-splitters==0.3.11
+langchain-pinecone==0.2.8
+pinecone==7.3.0
+langchain-huggingface==0.3.1
 sentence-transformers==4.1.0
 pypdf==5.6.1
-python-dotenv==1.1.0
-langchain-pinecone==0.2.8
-langchain-openai==0.3.24
-langchain-core==0.3.86
+
+# --- LLM providers (selected with LLM_PROVIDER) ---
 langchain-ollama==0.3.4
-langchain-huggingface==0.3.1
-langchain-community==0.3.26
--e .
+langchain-openai==0.3.24
