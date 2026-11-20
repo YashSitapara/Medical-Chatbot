@@ -1,0 +1,67 @@
+"""Application settings, loaded from environment variables / `.env`."""
+
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, SecretStr, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # --- Vector store ---
+    pinecone_api_key: SecretStr
+    pinecone_index_name: str = "medical-chatbot"
+    pinecone_cloud: str = "aws"
+    pinecone_region: str = "us-east-1"
+
+    # --- Embeddings (dimension is measured from the model, see app/embeddings.py) ---
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # --- LLM ---
+    llm_provider: Literal["ollama", "openai"] = "ollama"
+    llm_temperature: float = 0.0
+    ollama_model: str = "gemma3:4b"
+    ollama_base_url: str = "http://localhost:11434"
+    openai_api_key: SecretStr | None = None
+    openai_model: str = "gpt-4o-mini"
+
+    # --- Retrieval ---
+    retriever_k: int = Field(default=4, ge=1, le=20)
+    # Chunks scoring below this cosine similarity are discarded; if none remain the
+    # question is treated as out of scope and the LLM is not called. Model-specific:
+    # for all-MiniLM-L6-v2 on the medical book, on-topic hits score ~0.48-0.76 and
+    # off-topic questions ~0.18-0.32. Set to 0 to disable.
+    min_relevance_score: float = Field(default=0.40, ge=0.0, le=1.0)
+
+    # --- Chat memory ---
+    memory_max_turns: int = Field(default=10, ge=1)
+    memory_ttl_seconds: int = Field(default=3600, ge=60)
+    # "memory": per-process dict (single worker only). "redis": shared by every worker/container.
+    memory_backend: Literal["memory", "redis"] = "memory"
+    redis_url: str = "redis://localhost:6379/0"
+    redis_key_prefix: str = "medical-rag:chat:"
+
+    # --- Server ---
+    cors_origins: list[str] = ["*"]
+    log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def _check_provider_credentials(self) -> "Settings":
+        if self.llm_provider == "openai" and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        return self
+
+    @property
+    def llm_model_name(self) -> str:
+        return self.ollama_model if self.llm_provider == "ollama" else self.openai_model
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

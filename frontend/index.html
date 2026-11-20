@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Medical Chatbot</title>
+<style>
+  :root {
+    --bg: #1f2430;
+    --panel: rgba(0, 0, 0, 0.35);
+    --bot: #2e3a4d;
+    --user: #3b6fd8;
+    --text: #e8ecf3;
+    --muted: #9aa5b8;
+    --accent: #78c2ad;
+    --danger: #e06c75;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+    background: linear-gradient(to right, #26333d, #323741, #21214e);
+    display: flex; justify-content: center; align-items: center;
+    padding: 16px;
+  }
+  .chat {
+    width: 100%; max-width: 760px; height: min(860px, 100%);
+    display: flex; flex-direction: column;
+    background: var(--panel); border-radius: var(--radius); overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .avatar {
+    width: 40px; height: 40px; border-radius: 50%;
+    background: var(--accent); display: grid; place-items: center;
+    font-weight: 700; color: #123;
+  }
+  header h1 { font-size: 17px; margin: 0; }
+  header p { margin: 0; font-size: 13px; color: var(--muted); }
+  header button {
+    margin-left: auto; background: transparent; color: var(--text);
+    border: 1px solid rgba(255,255,255,0.2); border-radius: 8px;
+    padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px;
+  }
+  header button:hover { border-color: var(--accent); color: var(--accent); }
+  #messages { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: var(--radius); white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+  .msg.bot.pending::after { content: "▍"; animation: blink 1s steps(1) infinite; color: var(--accent); }
+  @keyframes blink { 50% { opacity: 0; } }
+  .msg sup a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .sources { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.1); white-space: normal; font-size: 13px; }
+  .sources summary { cursor: pointer; color: var(--muted); }
+  .sources ol { margin: 6px 0 0; padding-left: 22px; }
+  .sources li { margin-bottom: 6px; }
+  .sources li.uncited { opacity: 0.5; }
+  .sources li:target { outline: 1px solid var(--accent); border-radius: 4px; }
+  .sources .loc { font-weight: 600; }
+  .sources .snippet { color: var(--muted); display: block; margin-top: 2px; }
+  .empty { margin: auto; text-align: center; color: var(--muted); }
+  .error { color: var(--danger); }
+  form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid rgba(255,255,255,0.06); }
+  form input {
+    flex: 1; min-width: 0; padding: 12px 14px; border-radius: 10px; border: 0;
+    background: rgba(0,0,0,0.3); color: var(--text); font: inherit;
+  }
+  form input:focus { outline: 1px solid var(--accent); }
+  form button {
+    padding: 0 18px; border-radius: 10px; border: 0; cursor: pointer;
+    background: var(--accent); color: #123; font: inherit; font-weight: 600;
+  }
+  form button:disabled, form input:disabled { opacity: 0.5; cursor: not-allowed; }
+  footer { padding: 0 14px 10px; font-size: 12px; color: var(--muted); text-align: center; }
+  @media (max-width: 520px) { body { padding: 0; } .chat { border-radius: 0; height: 100%; } .msg { max-width: 95%; } }
+</style>
+</head>
+<body>
+<main class="chat">
+  <header>
+    <div class="avatar" aria-hidden="true">+</div>
+    <div>
+      <h1>Medical Chatbot</h1>
+      <p>Answers grounded in the medical reference, with sources</p>
+    </div>
+    <button id="new-chat" type="button">New chat</button>
+  </header>
+
+  <section id="messages" aria-live="polite">
+    <p class="empty" id="empty">Ask a medical question to get started.</p>
+  </section>
+
+  <form id="composer" autocomplete="off">
+    <input id="input" name="message" placeholder="Type your question…" maxlength="2000" required />
+    <button id="send" type="submit">Send</button>
+  </form>
+  <footer>For information only — not a substitute for professional medical advice.</footer>
+</main>
+
+<script>
+(() => {
+  const STORAGE_KEY = "medical-rag-session";
+  const messagesEl = document.getElementById("messages");
+  const form = document.getElementById("composer");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+  let msgCounter = 0;
+
+  const storage = {
+    get() { try { return localStorage.getItem(STORAGE_KEY); } catch { return null; } },
+    set(v) { try { localStorage.setItem(STORAGE_KEY, v); } catch {} },
+    clear() { try { localStorage.removeItem(STORAGE_KEY); } catch {} },
+  };
+  let sessionId = storage.get();
+
+  function hideEmpty() { document.getElementById("empty")?.remove(); }
+  function scrollDown() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+
+  function addMessage(role, text = "") {
+    hideEmpty();
+    const el = document.createElement("div");
+    el.className = `msg ${role}`;
+    el.dataset.msgId = String(++msgCounter);
+    const body = document.createElement("div");
+    body.className = "body";
+    body.textContent = text;
+    el.appendChild(body);
+    messagesEl.appendChild(el);
+    scrollDown();
+    return el;
+  }
+
+  // Render answer text safely, turning [n] into links to the matching source.
+  function renderAnswer(el, text, citations) {
+    const body = el.querySelector(".body");
+    body.textContent = "";
+    const ids = new Set((citations || []).map(c => c.id));
+    const parts = text.split(/(\[\d+\])/g);
+    for (const part of parts) {
+      const m = part.match(/^\[(\d+)\]$/);
+      if (m && ids.has(Number(m[1]))) {
+        const sup = document.createElement("sup");
+        const a = document.createElement("a");
+        a.href = `#src-${el.dataset.msgId}-${m[1]}`;
+        a.textContent = `[${m[1]}]`;
+        sup.appendChild(a);
+        body.appendChild(sup);
+      } else {
+        body.appendChild(document.createTextNode(part));
+      }
+    }
+  }
+
+  function renderSources(el, citations) {
+    el.querySelector(".sources")?.remove();
+    if (!citations || !citations.length) return;
+    const details = document.createElement("details");
+    details.className = "sources";
+    const anyCited = citations.some(c => c.cited);
+    details.open = anyCited;
+    const summary = document.createElement("summary");
+    summary.textContent = `Sources (${citations.length})`;
+    details.appendChild(summary);
+    const ol = document.createElement("ol");
+    for (const c of citations) {
+      const li = document.createElement("li");
+      li.id = `src-${el.dataset.msgId}-${c.id}`;
+      li.value = c.id;
+      if (anyCited && !c.cited) li.classList.add("uncited");
+      const loc = document.createElement("span");
+      loc.className = "loc";
+      loc.textContent = c.page != null ? `${c.source} · p. ${c.page}` : c.source;
+      const snip = document.createElement("span");
+      snip.className = "snippet";
+      snip.textContent = c.snippet;
+      li.append(loc, snip);
+      ol.appendChild(li);
+    }
+    details.appendChild(ol);
+    el.appendChild(details);
+  }
+
+  function setBusy(busy) {
+    input.disabled = busy;
+    sendBtn.disabled = busy;
+    if (!busy) input.focus();
+  }
+
+  // Minimal SSE parser for a fetch() ReadableStream (EventSource can't POST).
+  async function* readSSE(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const raw = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        let event = "message", data = "";
+        for (const line of raw.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (data) yield { event, data: JSON.parse(data) };
+      }
+    }
+  }
+
+  async function send(message) {
+    addMessage("user", message);
+    const bot = addMessage("bot");
+    bot.classList.add("pending");
+    const body = bot.querySelector(".body");
+    let text = "";
+    setBusy(true);
+    try {
+      const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, session_id: sessionId }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(typeof err.detail === "string" ? err.detail : `Request failed (${res.status})`);
+      }
+      for await (const { event, data } of readSSE(res)) {
+        if (event === "session") {
+          sessionId = data.session_id;
+          storage.set(sessionId);
+        } else if (event === "citations") {
+          renderSources(bot, data);
+        } else if (event === "token") {
+          text += data.text;
+          body.textContent = text;
+          scrollDown();
+        } else if (event === "done") {
+          renderAnswer(bot, data.answer, data.citations);
+          renderSources(bot, data.citations);
+        } else if (event === "error") {
+          throw new Error(data.detail);
+        }
+      }
+    } catch (e) {
+      body.textContent = text;
+      const err = document.createElement("div");
+      err.className = "error";
+      err.textContent = `⚠ ${e.message || "Something went wrong."}`;
+      bot.appendChild(err);
+    } finally {
+      bot.classList.remove("pending");
+      setBusy(false);
+      scrollDown();
+    }
+  }
+
+  async function restoreHistory() {
+    if (!sessionId) return;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
+      if (res.status === 404) { sessionId = null; storage.clear(); return; }
+      if (!res.ok) return;
+      const data = await res.json();
+      for (const m of data.messages) {
+        const el = addMessage(m.role === "user" ? "user" : "bot", m.content);
+        if (m.role !== "user") renderAnswer(el, m.content, []);
+      }
+    } catch {}
+  }
+
+  document.getElementById("new-chat").addEventListener("click", async () => {
+    if (sessionId) {
+      fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }).catch(() => {});
+    }
+    sessionId = null;
+    storage.clear();
+    messagesEl.innerHTML = '<p class="empty" id="empty">Ask a medical question to get started.</p>';
+    input.focus();
+  });
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const message = input.value.trim();
+    if (!message) return;
+    input.value = "";
+    send(message);
+  });
+
+  restoreHistory();
+  input.focus();
+})();
+</script>
+</body>
+</html>
