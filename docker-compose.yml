@@ -30,6 +30,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       # Workers per container (uvicorn reads WEB_CONCURRENCY). Each loads its own embedding model.
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      # Let uvicorn take the client IP (for per-IP rate limits) from nginx's X-Forwarded-For.
+      # "*" is safe ONLY because this service uses `expose`, not `ports`: nginx is the only
+      # thing that can reach it. Never use "*" on a port the internet can reach.
+      FORWARDED_ALLOW_IPS: "*"
       # Reach Ollama running on the host machine (macOS/Windows; Linux via host-gateway below).
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     extra_hosts:

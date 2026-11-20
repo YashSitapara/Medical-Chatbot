@@ -22,11 +22,14 @@ from urllib.parse import urlsplit, urlunsplit
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from app.config import Settings
+from app.errors import DependencyUnavailableError
 from app.schemas import Message
 
 
-class MemoryUnavailableError(RuntimeError):
+class MemoryUnavailableError(DependencyUnavailableError):
     """The memory backend can't be reached. Mapped to HTTP 503 by the API."""
+
+    public_detail = "Chat memory is temporarily unavailable."
 
 
 class ChatMemory(ABC):
