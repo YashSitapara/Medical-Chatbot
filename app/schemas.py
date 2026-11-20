@@ -54,3 +54,17 @@ class HealthResponse(BaseModel):
     llm_model: str
     index: str
     memory_backend: str
+
+
+class CheckResult(BaseModel):
+    ok: bool
+    latency_ms: float
+    error: str | None = Field(
+        default=None,
+        description="'timed out after Ns' or the exception class name. Details are only logged.",
+    )
+
+
+class ReadyResponse(BaseModel):
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, CheckResult] = Field(description="Keyed by dependency: redis (or memory), pinecone.")
