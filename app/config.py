@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "medical-rag:chat:"
 
+    # --- Readiness (/ready) ---
+    # Time limit for EACH dependency check (Redis ping, Pinecone stats); they run concurrently.
+    ready_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+
     # --- Server ---
     cors_origins: list[str] = ["*"]
     log_level: str = "INFO"

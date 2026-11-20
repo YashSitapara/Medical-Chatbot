@@ -15,7 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from app.config import get_settings
 from app.memory import ChatMemory, MemoryUnavailableError, build_memory
 from app.rag import RAGService
-from app.schemas import ChatRequest, ChatResponse, HealthResponse, HistoryResponse
+from app.readiness import check_readiness
+from app.schemas import ChatRequest, ChatResponse, HealthResponse, HistoryResponse, ReadyResponse
 
 logger = logging.getLogger("medical_rag")
 
@@ -117,6 +118,22 @@ def create_app() -> FastAPI:
             index=s.pinecone_index_name,
             memory_backend=memory.backend,
         )
+
+    @app.get(
+        "/ready",
+        response_model=ReadyResponse,
+        tags=["meta"],
+        responses={503: {"model": ReadyResponse, "description": "A dependency failed or timed out"}},
+    )
+    async def ready(
+        rag: RAGService = Depends(get_rag),
+        memory: ChatMemory = Depends(get_memory),
+    ) -> JSONResponse:
+        """Readiness: Redis ping + Pinecone index stats, each with a time limit. Used by the
+        Docker healthcheck. 200 if both pass, else 503 with the failing check marked."""
+        result = await check_readiness(memory, rag, rag.settings.ready_timeout_seconds)
+        code = status.HTTP_200_OK if result.status == "ready" else status.HTTP_503_SERVICE_UNAVAILABLE
+        return JSONResponse(result.model_dump(), status_code=code)
 
     @app.post("/api/chat", response_model=ChatResponse, tags=["chat"])
     async def chat(

@@ -248,6 +248,15 @@ class RAGService:
         self.vectorstore = vectorstore or build_vectorstore(settings)
         self._condense_chain = condense_prompt | self.llm | StrOutputParser()
 
+    def ping_vectorstore(self, timeout: float | None = None) -> None:
+        """Cheapest Pinecone round trip: index stats (no embedding, no query). Blocking.
+
+        `timeout` is passed to the HTTP request itself, so a hung call ends on its own
+        even after the async caller has stopped waiting for this thread.
+        """
+        kwargs = {"_request_timeout": timeout} if timeout else {}
+        self.vectorstore.index.describe_index_stats(**kwargs)
+
     async def condense_question(self, question: str, history: list[Message]) -> str:
         """Turn a follow-up into a standalone search query. No-op without history."""
         if not history:
