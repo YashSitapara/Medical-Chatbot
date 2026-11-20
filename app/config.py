@@ -47,6 +47,22 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "medical-rag:chat:"
 
+    # --- Timeouts and retries ---
+    # LLM: an httpx *read* timeout (no bytes for N seconds), so long streamed answers are fine.
+    llm_timeout_seconds: float = Field(default=30.0, gt=0)
+    llm_max_retries: int = Field(default=2, ge=0, le=5)  # OpenAI only; Ollama is local
+    condense_timeout_seconds: float = Field(default=10.0, gt=0)  # on timeout: dual-retrieval fallback
+    retrieval_timeout_seconds: float = Field(default=5.0, gt=0)  # per Pinecone attempt
+    retrieval_max_attempts: int = Field(default=3, ge=1, le=10)
+    request_timeout_seconds: float = Field(default=45.0, gt=0)  # overall cap: 504 / SSE timeout event
+
+    # --- Rate limiting (/api/chat, /api/chat/stream) ---
+    rate_limit_enabled: bool = True
+    rate_limit_per_minute: int = Field(default=10, ge=1)  # per session
+    # Per client IP. Higher than the per-session limit so several people behind one NAT can
+    # chat, but it still stops a client that sends a new session_id with every request.
+    rate_limit_per_ip_per_minute: int = Field(default=30, ge=1)
+
     # --- Readiness (/ready) ---
     # Time limit for EACH dependency check (Redis ping, Pinecone stats); they run concurrently.
     ready_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
@@ -54,6 +70,11 @@ class Settings(BaseSettings):
     # --- Server ---
     cors_origins: list[str] = ["*"]
     log_level: str = "INFO"
+    # "json" (one JSON object per line, for log collectors) or "console" (readable, for a terminal).
+    log_format: Literal["json", "console"] = "json"
+    # LOCAL DEVELOPMENT ONLY. Adds the user's question and the rewritten question to the logs.
+    # Off: logs carry metadata only (lengths, scores, latencies), never question text.
+    log_content: bool = False
 
     @model_validator(mode="after")
     def _check_provider_credentials(self) -> "Settings":
