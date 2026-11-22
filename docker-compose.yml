@@ -35,7 +35,11 @@ services:
       # thing that can reach it. Never use "*" on a port the internet can reach.
       FORWARDED_ALLOW_IPS: "*"
       # Reach Ollama running on the host machine (macOS/Windows; Linux via host-gateway below).
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      # A Docker-specific variable on purpose: Compose fills ${...} from .env, and .env's
+      # OLLAMA_BASE_URL=http://localhost:11434 (right for uvicorn on the host) would point the
+      # containers at THEMSELVES -> ConnectError -> "assistant temporarily unavailable" (503).
+      # For a remote Ollama: DOCKER_OLLAMA_BASE_URL=http://my-gpu-box:11434 in .env or the shell.
+      OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     expose:
@@ -67,7 +71,7 @@ services:
     profiles: ["ingest"]
 
   # Optional: run Ollama in a container instead of on the host.
-  # Then set OLLAMA_BASE_URL=http://ollama:11434 and `docker compose exec ollama ollama pull gemma3:4b`.
+  # Then set DOCKER_OLLAMA_BASE_URL=http://ollama:11434 and `docker compose exec ollama ollama pull gemma3:4b`.
   # ollama:
   #   image: ollama/ollama:latest
   #   ports: ["11434:11434"]
