@@ -67,6 +67,20 @@ class Settings(BaseSettings):
     # Time limit for EACH dependency check (Redis ping, Pinecone stats); they run concurrently.
     ready_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
 
+    # --- Tracing (Langfuse) ---
+    # Off by default so tests and a fresh clone run without keys. When on, each chat request
+    # becomes one Langfuse trace (question, rewrite, chunks, full prompt, answer), with phone
+    # numbers / emails / Aadhaar / PAN masked first (app/tracing.py: mask_pii).
+    tracing_enabled: bool = False
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: SecretStr | None = None
+    # EU region. US: https://us.cloud.langfuse.com
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+    langfuse_environment: str = Field(default="development", pattern=r"^[a-z0-9_-]{1,40}$")
+    langfuse_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    langfuse_retention_days: int = Field(default=30, ge=1)  # scripts/langfuse_retention.py
+    feedback_rate_limit_per_ip_per_minute: int = Field(default=30, ge=1)
+
     # --- Server ---
     cors_origins: list[str] = ["*"]
     log_level: str = "INFO"
@@ -80,6 +94,8 @@ class Settings(BaseSettings):
     def _check_provider_credentials(self) -> "Settings":
         if self.llm_provider == "openai" and not self.openai_api_key:
             raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        if self.tracing_enabled and not (self.langfuse_public_key and self.langfuse_secret_key):
+            raise ValueError("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are required when TRACING_ENABLED=true")
         return self
 
     @property

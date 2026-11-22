@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 from typing_extensions import Annotated
 
 MessageText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
@@ -35,12 +35,18 @@ class ChatResponse(BaseModel):
     session_id: str
     answer: str
     citations: list[Citation]
+    trace_id: str | None = Field(
+        default=None,
+        description="Langfuse trace of this answer (for POST /api/feedback). Null when tracing is off.",
+    )
 
 
 class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     created_at: datetime = Field(default_factory=_now)
+    # Assistant turns only: the Langfuse trace, so restored history can still be rated.
+    trace_id: str | None = None
 
 
 class HistoryResponse(BaseModel):
@@ -68,3 +74,18 @@ class CheckResult(BaseModel):
 class ReadyResponse(BaseModel):
     status: Literal["ready", "not_ready"]
     checks: dict[str, CheckResult] = Field(description="Keyed by dependency: redis (or memory), pinecone.")
+
+
+class FeedbackRequest(BaseModel):
+    trace_id: str = Field(pattern=r"^[0-9a-f]{32}$", description="trace_id from a chat response.")
+    rating: Literal[1, -1] = Field(description="1 = helpful (thumbs up), -1 = not helpful.")
+    comment: Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)] | None = None
+
+    @field_validator("comment")
+    @classmethod
+    def _empty_is_none(cls, value: str | None) -> str | None:
+        return value or None
+
+
+class FeedbackResponse(BaseModel):
+    status: Literal["accepted"] = "accepted"

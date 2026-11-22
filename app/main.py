@@ -31,7 +31,16 @@ from app.request_context import (
     set_outcome,
     set_session,
 )
-from app.schemas import ChatRequest, ChatResponse, HealthResponse, HistoryResponse, ReadyResponse
+from app.schemas import (
+    ChatRequest,
+    ChatResponse,
+    FeedbackRequest,
+    FeedbackResponse,
+    HealthResponse,
+    HistoryResponse,
+    ReadyResponse,
+)
+from app.tracing import NoopTracer, RequestTrace, Tracer, build_tracer
 
 logger = structlog.get_logger("medical_rag")
 
@@ -77,6 +86,17 @@ async def lifespan(app: FastAPI):
         per_ip=settings.rate_limit_per_ip_per_minute,
     )
 
+    if not hasattr(app.state, "tracer"):  # tests may inject one
+        app.state.tracer = build_tracer(settings)
+    tracer: Tracer = app.state.tracer
+    logger.info(
+        "tracing_ready",
+        enabled=tracer.enabled,
+        host=settings.langfuse_base_url if tracer.enabled else None,
+        environment=settings.langfuse_environment if tracer.enabled else None,
+        sample_rate=settings.langfuse_sample_rate if tracer.enabled else None,
+    )
+
     workers = int(os.environ.get("WEB_CONCURRENCY", "1") or 1)
     if memory.backend == "memory" and workers > 1:
         logger.warning(
@@ -90,6 +110,7 @@ async def lifespan(app: FastAPI):
     await memory.close()
     if limiter is not None:
         await limiter.close()
+    await asyncio.to_thread(tracer.shutdown)  # flush buffered spans and feedback scores
 
 
 def get_rag(request: Request) -> RAGService:
@@ -98,6 +119,10 @@ def get_rag(request: Request) -> RAGService:
 
 def get_memory(request: Request) -> ChatMemory:
     return request.app.state.memory
+
+
+def get_tracer(request: Request) -> Tracer:
+    return getattr(request.app.state, "tracer", None) or NoopTracer()
 
 
 def _error_body(detail, code: str) -> dict:
@@ -117,8 +142,25 @@ async def enforce_rate_limit(request: Request, body: ChatRequest, response: Resp
         return
     if body.session_id:
         set_session(body.session_id)
-    ip = request.client.host if request.client else "unknown"
-    decision = await limiter.check(body.session_id, ip)
+    decision = await limiter.check(body.session_id, _client_ip(request))
+    _apply_rate_limit(request, response, decision)
+
+
+async def enforce_feedback_rate_limit(request: Request, response: Response) -> None:
+    """POST /api/feedback: its own per-IP counter, so rating answers doesn't use up chat quota."""
+    limiter: FixedWindowRateLimiter | None = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:
+        return
+    limit = get_rag(request).settings.feedback_rate_limit_per_ip_per_minute
+    decision = await limiter.check_scoped("feedback", _client_ip(request), limit)
+    _apply_rate_limit(request, response, decision)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _apply_rate_limit(request: Request, response: Response, decision) -> None:
     headers = decision.headers()
     if not decision.allowed:
         set_outcome("rate_limited")
@@ -131,6 +173,13 @@ async def enforce_rate_limit(request: Request, body: ChatRequest, response: Resp
         )
     response.headers.update(headers)  # merged into /api/chat's JSON response
     request.state.rate_limit_headers = headers  # StreamingResponse is returned directly: copied there
+
+
+def _outcome_or_ok() -> str:
+    from app.request_context import current
+
+    ctx = current()
+    return (ctx.outcome if ctx and ctx.outcome else None) or "ok"
 
 
 def _request_started(request: Request, settings: Settings, body: ChatRequest, session_id: str, stream: bool) -> None:
@@ -147,6 +196,10 @@ def _request_started(request: Request, settings: Settings, body: ChatRequest, se
         question_chars=len(body.message),
         **extra,
     )
+
+
+def _trace_output(answer: str, citations) -> dict:
+    return {"answer": answer, "cited": [c.id for c in citations if c.cited]}
 
 
 def _sse(event: str, data) -> str:
@@ -270,17 +323,21 @@ def create_app() -> FastAPI:
     ) -> ChatResponse:
         session_id = body.session_id or str(uuid.uuid4())
         _request_started(request, rag.settings, body, session_id, stream=False)
-        history = await memory.get(session_id)
-        # Dependency errors -> 503 and bugs -> 500 propagate to the handlers / middleware.
-        try:
-            async with asyncio.timeout(rag.settings.request_timeout_seconds) as cap:
-                answer, citations = await rag.answer(body.message, history)
-        except TimeoutError:
-            if cap.expired():  # our overall cap, not some inner timeout
-                raise RequestTimeoutError() from None
-            raise
-        await memory.append(session_id, body.message, answer)
-        return ChatResponse(session_id=session_id, answer=answer, citations=citations)
+        # One Langfuse trace per request (a no-op when TRACING_ENABLED=false). An exception
+        # leaving this block is recorded on the trace by class name, then re-raised.
+        with get_tracer(request).request_trace("chat", session_id, current_request_id(), body.message) as trace:
+            history = await memory.get(session_id)
+            # Dependency errors -> 503 and bugs -> 500 propagate to the handlers / middleware.
+            try:
+                async with asyncio.timeout(rag.settings.request_timeout_seconds) as cap:
+                    answer, citations = await rag.answer(body.message, history)
+            except TimeoutError:
+                if cap.expired():  # our overall cap, not some inner timeout
+                    raise RequestTimeoutError() from None
+                raise
+            await memory.append(session_id, body.message, answer, trace_id=trace.trace_id)
+            trace.finish(output=_trace_output(answer, citations), outcome=_outcome_or_ok())
+        return ChatResponse(session_id=session_id, answer=answer, citations=citations, trace_id=trace.trace_id)
 
     @app.post(
         "/api/chat/stream",
@@ -301,8 +358,21 @@ def create_app() -> FastAPI:
         history = await memory.get(session_id)  # before streaming starts, so failures are a clean 503
 
         cap_seconds = rag.settings.request_timeout_seconds
+        tracer = get_tracer(request)
+        request_id = current_request_id()
 
         async def events() -> AsyncIterator[str]:
+            # Entered inside the generator: Starlette iterates it in ONE task, so the root
+            # span's context is attached and detached in the same place.
+            with tracer.request_trace("chat-stream", session_id, request_id, body.message) as trace:
+                async for chunk in _stream_events(trace):
+                    yield chunk
+
+        async def _stream_events(trace: RequestTrace) -> AsyncIterator[str]:
+            def error_event(detail: str, code: str, exc: BaseException) -> str:
+                trace.finish(outcome=code if code != "internal_error" else "error", error=exc)
+                return _sse("error", {**_error_body(detail, code), "trace_id": trace.trace_id})
+
             yield _sse("session", {"session_id": session_id})
             loop = asyncio.get_running_loop()
             deadline = loop.time() + cap_seconds
@@ -325,6 +395,7 @@ def create_app() -> FastAPI:
                     if await request.is_disconnected():
                         logger.info("client_disconnected", detail="turn not saved")
                         set_outcome("client_disconnected")
+                        trace.finish(outcome="client_disconnected")
                         return
                     if event.type == "citations":
                         yield _sse("citations", [c.model_dump() for c in event.data])
@@ -332,13 +403,15 @@ def create_app() -> FastAPI:
                         yield _sse("token", {"text": event.data})
                     elif event.type == "done":
                         answer = event.data["answer"]
-                        await memory.append(session_id, body.message, answer)
+                        await memory.append(session_id, body.message, answer, trace_id=trace.trace_id)
+                        trace.finish(output=_trace_output(answer, event.data["citations"]), outcome=_outcome_or_ok())
                         yield _sse(
                             "done",
                             {
                                 "session_id": session_id,
                                 "answer": answer,
                                 "citations": [c.model_dump() for c in event.data["citations"]],
+                                "trace_id": trace.trace_id,
                             },
                         )
             # HTTP 200 was already sent: the error event + outcome carry the failure instead.
@@ -346,23 +419,58 @@ def create_app() -> FastAPI:
             except RequestTimeoutError as exc:
                 logger.warning("request_timeout", limit_seconds=cap_seconds)
                 set_outcome("timeout")
-                yield _sse("error", _error_body(exc.public_detail, exc.code))
+                yield error_event(exc.public_detail, exc.code, exc)
             except DependencyUnavailableError as exc:
                 cause = exc.__cause__
                 logger.warning("dependency_unavailable", error=type(exc).__name__,
                                cause=type(cause).__name__ if cause else None, detail=str(exc))
                 set_outcome("dependency_unavailable")
-                yield _sse("error", _error_body(exc.public_detail, exc.code))
-            except Exception:
+                yield error_event(exc.public_detail, exc.code, exc)
+            except Exception as exc:
                 logger.exception("chat_stream_failed")
                 set_outcome("error")
-                yield _sse("error", _error_body("Something went wrong on our side.", "internal_error"))
+                yield error_event("Something went wrong on our side.", "internal_error", exc)
             finally:
                 await stream.aclose()  # stops the LLM stream on timeout/error/disconnect
 
         headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         headers.update(getattr(request.state, "rate_limit_headers", {}))
         return StreamingResponse(events(), media_type="text/event-stream", headers=headers)
+
+    @app.post(
+        "/api/feedback",
+        response_model=FeedbackResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["feedback"],
+        dependencies=[Depends(enforce_feedback_rate_limit)],
+        responses={
+            429: {"description": "Rate limit exceeded (see Retry-After)"},
+            503: {"description": "Tracing is disabled, or the score could not be queued"},
+        },
+    )
+    async def feedback(body: FeedbackRequest, request: Request) -> FeedbackResponse | JSONResponse:
+        """👍/👎 on an answer: stored as the `user_feedback` score (1 or -1) on its Langfuse trace.
+
+        Sent in the background (202). Sending again for the same trace replaces the score.
+        The trace_id acts as the permission: 128 random bits, only given to the client that asked.
+        """
+        tracer = get_tracer(request)
+        if not tracer.enabled:
+            return JSONResponse(
+                _error_body("Feedback is unavailable because tracing is disabled.", "tracing_disabled"),
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        try:
+            tracer.score(body.trace_id, body.rating, body.comment)
+        except Exception as exc:
+            logger.warning("feedback_failed", error=type(exc).__name__)
+            return JSONResponse(
+                _error_body("Feedback could not be recorded. Please try again.", "feedback_unavailable"),
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        logger.info("feedback_received", feedback_trace_id=body.trace_id, rating=body.rating,
+                    has_comment=body.comment is not None)
+        return FeedbackResponse()
 
     @app.get("/api/sessions/{session_id}/history", response_model=HistoryResponse, tags=["sessions"])
     async def get_history(session_id: str, memory: ChatMemory = Depends(get_memory)) -> HistoryResponse:

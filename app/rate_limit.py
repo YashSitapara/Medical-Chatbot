@@ -4,6 +4,7 @@ Each request increments up to two counters for the current minute:
 
     ratelimit:session:{session_id}:{minute}   limit RATE_LIMIT_PER_MINUTE        (if a session is sent)
     ratelimit:ip:{ip}:{minute}                limit RATE_LIMIT_PER_IP_PER_MINUTE
+    ratelimit:feedback:ip:{ip}:{minute}       limit FEEDBACK_RATE_LIMIT_PER_IP_PER_MINUTE (POST /api/feedback)
 
 The IP counter matters because session_id comes from the client: a script could send a new
 one with every request. Over either limit -> 429 with Retry-After.
@@ -70,15 +71,22 @@ class FixedWindowRateLimiter(ABC):
         pass
 
     async def check(self, session_id: str | None, ip: str) -> RateLimitDecision:
-        now = self._clock()
-        window = int(now // WINDOW_SECONDS)
-        retry_after = max(1, math.ceil(WINDOW_SECONDS - now % WINDOW_SECONDS))
-
+        """The chat routes: per-session and per-IP counters."""
+        window = int(self._clock() // WINDOW_SECONDS)
         buckets: list[tuple[str, str, int]] = []
         if session_id:
             buckets.append(("session", f"ratelimit:session:{session_id}:{window}", self.per_session))
         buckets.append(("ip", f"ratelimit:ip:{ip}:{window}", self.per_ip))
+        return await self._decide(buckets)
 
+    async def check_scoped(self, scope: str, ip: str, limit: int) -> RateLimitDecision:
+        """A separate per-IP counter (e.g. scope="feedback"), so it never uses up the chat allowance."""
+        window = int(self._clock() // WINDOW_SECONDS)
+        return await self._decide([("ip", f"ratelimit:{scope}:ip:{ip}:{window}", limit)])
+
+    async def _decide(self, buckets: list[tuple[str, str, int]]) -> RateLimitDecision:
+        now = self._clock()
+        retry_after = max(1, math.ceil(WINDOW_SECONDS - now % WINDOW_SECONDS))
         try:
             counts = await self._increment([key for _, key, _ in buckets])
         except RateLimiterUnavailable as exc:
