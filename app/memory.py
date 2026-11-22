@@ -40,7 +40,7 @@ class ChatMemory(ABC):
         """Return the session's messages (oldest first) and refresh its TTL."""
 
     @abstractmethod
-    async def append(self, session_id: str, user: str, assistant: str) -> None:
+    async def append(self, session_id: str, user: str, assistant: str, trace_id: str | None = None) -> None:
         """Store one completed turn (user question + assistant answer)."""
 
     @abstractmethod
@@ -100,7 +100,7 @@ class InMemoryChatMemory(ChatMemory):
             session.last_access = self._clock()
             return list(session.messages)
 
-    async def append(self, session_id: str, user: str, assistant: str) -> None:
+    async def append(self, session_id: str, user: str, assistant: str, trace_id: str | None = None) -> None:
         with self._lock:
             self._evict_expired()
             session = self._sessions.get(session_id)
@@ -108,7 +108,7 @@ class InMemoryChatMemory(ChatMemory):
                 session = _Session(messages=deque(maxlen=self._max_messages), last_access=self._clock())
                 self._sessions[session_id] = session
             session.messages.append(Message(role="user", content=user))
-            session.messages.append(Message(role="assistant", content=assistant))
+            session.messages.append(Message(role="assistant", content=assistant, trace_id=trace_id))
             session.last_access = self._clock()
 
     async def clear(self, session_id: str) -> bool:
@@ -195,13 +195,13 @@ class RedisChatMemory(ChatMemory):
             raise self._unavailable(exc) from exc
         return [Message.model_validate_json(item) for item in raw]
 
-    async def append(self, session_id: str, user: str, assistant: str) -> None:
+    async def append(self, session_id: str, user: str, assistant: str, trace_id: str | None = None) -> None:
         from redis.exceptions import RedisError
 
         key = self.key(session_id)
         items = [
             Message(role="user", content=user).model_dump_json(),
-            Message(role="assistant", content=assistant).model_dump_json(),
+            Message(role="assistant", content=assistant, trace_id=trace_id).model_dump_json(),
         ]
         try:
             async with self._redis.pipeline(transaction=True) as pipe:

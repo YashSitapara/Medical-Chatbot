@@ -62,6 +62,25 @@
   .sources li:target { outline: 1px solid var(--accent); border-radius: 4px; }
   .sources .loc { font-weight: 600; }
   .sources .snippet { color: var(--muted); display: block; margin-top: 2px; }
+  .feedback { margin-top: 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; white-space: normal; font-size: 13px; }
+  .feedback .rate {
+    background: transparent; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
+    padding: 2px 8px; cursor: pointer; font: inherit; color: var(--text); line-height: 1.6;
+  }
+  .feedback .rate:hover { border-color: var(--accent); }
+  .feedback .rate[aria-pressed="true"] { border-color: var(--accent); background: rgba(120,194,173,0.18); }
+  .feedback .comment { display: flex; gap: 6px; flex-basis: 100%; }
+  .feedback .comment input {
+    flex: 1; min-width: 0; padding: 6px 10px; border-radius: 8px; border: 0;
+    background: rgba(0,0,0,0.3); color: var(--text); font: inherit;
+  }
+  .feedback .comment input:focus { outline: 1px solid var(--accent); }
+  .feedback .comment button {
+    border: 0; border-radius: 8px; padding: 0 12px; cursor: pointer;
+    background: var(--accent); color: #123; font: inherit; font-weight: 600;
+  }
+  .feedback .status { color: var(--muted); }
+  .feedback .status.error { color: var(--danger); }
   .empty { margin: auto; text-align: center; color: var(--muted); }
   .error { color: var(--danger); }
   form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid rgba(255,255,255,0.06); }
@@ -184,6 +203,80 @@
     el.appendChild(details);
   }
 
+  // 👍/👎 under an answer -> POST /api/feedback (a score on the answer's Langfuse trace).
+  // Sending again for the same trace replaces the score, so changing your mind is fine.
+  function renderFeedback(el, traceId) {
+    el.querySelector(".feedback")?.remove();
+    if (!traceId) return;  // tracing off, or no trace for this answer
+    const box = document.createElement("div");
+    box.className = "feedback";
+    const status = document.createElement("span");
+    status.className = "status";
+    status.setAttribute("role", "status");
+    let rating = null;
+
+    async function submit(comment) {
+      status.className = "status";
+      status.textContent = "Sending…";
+      try {
+        const res = await fetch("/api/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ trace_id: traceId, rating, comment: comment || null }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          const msg = typeof err.detail === "string" ? err.detail : `Feedback failed (${res.status})`;
+          throw withRef(new Error(msg), res.headers.get("X-Request-ID"));
+        }
+        status.textContent = comment ? "Thanks for the details!" : "Thanks for your feedback!";
+        return true;
+      } catch (e) {
+        status.className = "status error";
+        const ref = e.requestId ? ` (ref: ${e.requestId.slice(0, 8)})` : "";
+        status.textContent = `⚠ ${e.message || "Feedback failed."}${ref}`;
+        return false;
+      }
+    }
+
+    const commentRow = document.createElement("div");
+    commentRow.className = "comment";
+    commentRow.hidden = true;
+    const commentInput = document.createElement("input");
+    commentInput.maxLength = 500;
+    commentInput.placeholder = "Add a comment (optional)";
+    commentInput.setAttribute("aria-label", "Feedback comment (optional)");
+    const commentSend = document.createElement("button");
+    commentSend.type = "button";
+    commentSend.textContent = "Send";
+    async function sendComment() {
+      const text = commentInput.value.trim();
+      if (text && await submit(text)) { commentInput.value = ""; commentRow.hidden = true; }
+    }
+    commentSend.addEventListener("click", sendComment);
+    commentInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sendComment(); } });
+    commentRow.append(commentInput, commentSend);
+
+    const buttons = [[1, "👍", "Helpful"], [-1, "👎", "Not helpful"]].map(([value, icon, label]) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "rate";
+      b.textContent = icon;
+      b.title = label;
+      b.setAttribute("aria-label", label);
+      b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", async () => {
+        rating = value;
+        for (const other of buttons) other.setAttribute("aria-pressed", String(other === b));
+        if (await submit(null)) commentRow.hidden = false;
+      });
+      return b;
+    });
+
+    box.append(...buttons, status, commentRow);
+    el.appendChild(box);
+  }
+
   function setBusy(busy) {
     input.disabled = busy;
     sendBtn.disabled = busy;
@@ -249,6 +342,7 @@
         } else if (event === "done") {
           renderAnswer(bot, data.answer, data.citations);
           renderSources(bot, data.citations);
+          renderFeedback(bot, data.trace_id);
         } else if (event === "error") {
           throw withRef(new Error(data.detail), data.request_id);
         }
@@ -277,7 +371,10 @@
       const data = await res.json();
       for (const m of data.messages) {
         const el = addMessage(m.role === "user" ? "user" : "bot", m.content);
-        if (m.role !== "user") renderAnswer(el, m.content, []);
+        if (m.role !== "user") {
+          renderAnswer(el, m.content, []);
+          renderFeedback(el, m.trace_id);
+        }
       }
     } catch {}
   }

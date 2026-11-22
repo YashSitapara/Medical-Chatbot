@@ -19,7 +19,9 @@ app/
   schemas.py   request/response models
   rag.py       condense → retrieve → prompt → generate, citations
   memory.py    per-session chat history (in-process or Redis)
+  tracing.py   Langfuse traces + feedback scores, PII masking
 scripts/ingest.py   load PDFs → chunk → embed → upsert to Pinecone
+scripts/langfuse_retention.py   delete Langfuse traces older than 30 days (run by hand)
 frontend/index.html chat UI (served at /)
 tests/              pytest suite (no network needed)
 ```
@@ -56,6 +58,15 @@ docker compose up --build --scale api=3     # 3 API replicas sharing history via
 
 Compose runs **Redis** (for chat history), the **API**, and **nginx** as the entry point on port 8000. nginx spreads requests across API replicas and passes streamed tokens through without buffering. Each response has an `X-Upstream` header showing which replica answered.
 
+**Ollama in Docker.** The API containers reach Ollama on your machine at `http://host.docker.internal:11434`. They deliberately ignore `OLLAMA_BASE_URL` from `.env`, which is `http://localhost:11434` for running uvicorn on the host: inside a container, `localhost` is the container itself, so every answer would fail with "The assistant is temporarily unavailable" (`ConnectError` in the logs). To use a different Ollama, such as a GPU server or the optional `ollama` service, set `DOCKER_OLLAMA_BASE_URL`:
+
+```bash
+DOCKER_OLLAMA_BASE_URL=http://my-gpu-box:11434 docker compose up -d   # or put it in .env
+docker compose exec api printenv OLLAMA_BASE_URL                      # what the containers actually use
+```
+
+`/ready` checks Redis and Pinecone, not the LLM, so a wrong Ollama URL still shows the containers as healthy.
+
 The API containers reach Ollama on your host at `host.docker.internal:11434`. The embedding model is downloaded when the image is built.
 
 ## API
@@ -64,8 +75,9 @@ The API containers reach Ollama on your host at `host.docker.internal:11434`. Th
 |---|---|---|
 | `GET` | `/health` | Status, LLM provider/model, index name (503 if chat memory is down) |
 | `GET` | `/ready` | Readiness: Redis ping + Pinecone index stats, each ≤ `READY_TIMEOUT_SECONDS` (5s). 200, or 503 naming the failed check |
-| `POST` | `/api/chat` | `{message, session_id?}` → `{session_id, answer, citations[]}`. Rate limited. |
+| `POST` | `/api/chat` | `{message, session_id?}` → `{session_id, answer, citations[], trace_id}`. Rate limited. |
 | `POST` | `/api/chat/stream` | Same body, streamed back as SSE (see below). Rate limited. |
+| `POST` | `/api/feedback` | `{trace_id, rating: 1 \| -1, comment?}` → 202. 👍/👎 on an answer, stored on its Langfuse trace. 503 `tracing_disabled` when tracing is off. Rate limited (own counter). |
 | `GET` | `/api/sessions/{id}/history` | Messages in the session (404 if unknown or expired) |
 | `DELETE` | `/api/sessions/{id}` | Clear the session |
 
@@ -85,8 +97,8 @@ Each citation looks like this:
 event: session    data: {"session_id": "..."}
 event: citations  data: [Citation, ...]              # sent before the first token
 event: token      data: {"text": "..."}              # repeated
-event: done       data: {"session_id", "answer", "citations"}
-event: error      data: {"detail", "code", "request_id"}   # instead of done, on failure
+event: done       data: {"session_id", "answer", "citations", "trace_id"}
+event: error      data: {"detail", "code", "request_id", "trace_id"}   # instead of done, on failure
 ```
 
 The HTTP status is already 200 by the time a stream fails, so the `code` of the `error` event says what went wrong (same codes as below).
@@ -201,6 +213,7 @@ Every error response has the same body: `{"detail": "...", "code": "...", "reque
 | 504 | `timeout` | The request hit `REQUEST_TIMEOUT_SECONDS`. Streams send an `error` event with this code instead. |
 | 500 | `internal_error` | A bug in our code, or our configuration (e.g. the LLM or Pinecone rejects the API key). Not retried. |
 | 429 | `rate_limited` | See below. |
+| 503 | `tracing_disabled` / `feedback_unavailable` | `POST /api/feedback` only: tracing is off, or the score could not be queued. |
 | 404 / 422 | `not_found` / `validation_error` | Unknown session or route / invalid request body. |
 
 A partial streamed answer is never saved to chat history.
@@ -237,10 +250,100 @@ See [.env.example](.env.example) for every setting. The main ones:
 - `MEMORY_BACKEND` (`memory` | `redis`), `REDIS_URL`, `REDIS_KEY_PREFIX`: where history is stored. Use `redis` for more than one worker or container.
 - `LOG_LEVEL`, `LOG_FORMAT` (`json` | `console`), `LOG_CONTENT`: see [Logging](#logging).
 - Timeouts and retries: see [Timeouts, retries and errors](#timeouts-retries-and-errors). Rate limits: see [Rate limiting](#rate-limiting).
+- `TRACING_ENABLED`, `LANGFUSE_*`: see [Tracing & feedback](#tracing--feedback-langfuse).
+
+## Tracing & feedback (Langfuse)
+
+Logs deliberately contain no text, so they can't show *what the model was given*. A Langfuse trace can: for any answer, open one trace and see the rewritten question, the chunks retrieved (with scores and pages), the exact prompt, and the output with token counts. Users rate answers with 👍/👎, and the rating is attached to that trace.
+
+### Setup (Langfuse Cloud, free Hobby tier)
+
+1. Sign up at [cloud.langfuse.com](https://cloud.langfuse.com) (EU region; recommended, since traces contain health questions) and create a project.
+2. In **Project Settings → API Keys**, create a key pair and add it to `.env`:
+   ```bash
+   TRACING_ENABLED=true
+   LANGFUSE_PUBLIC_KEY=pk-lf-...
+   LANGFUSE_SECRET_KEY=sk-lf-...
+   # LANGFUSE_BASE_URL=https://us.cloud.langfuse.com   # only for the US region
+   ```
+3. Restart the app. The startup log shows `tracing_ready` with `enabled: true`.
+
+With `TRACING_ENABLED=true` and a key missing, the app refuses to start. With tracing off (the default), responses carry `trace_id: null` and the 👍/👎 buttons are hidden.
+
+### What a trace contains
+
+One trace per chat request, named `chat` or `chat-stream`, grouped by session (**Sessions** tab):
+
+| Observation | Input | Output / details |
+|---|---|---|
+| `chat` (root) | the question | answer and the cited passage numbers; `outcome`, `condense_strategy`; level ERROR/WARNING on failures (exception class name only) |
+| `condense` | the chat transcript actually sent, and the question | rewritten question, `strategy` (`skipped` / `llm` / `fallback_dual`), rejection `reason`, `raw_rewrite`; model and tokens. WARNING when the rewrite was rejected. |
+| `retrieve` | the search query (or both fallback queries) | every chunk returned: `id`, `score`, `page`, `source`, `passed` (above the threshold, i.e. used); `attempts` (Pinecone retries) |
+| `retrieve.plain` / `retrieve.combined` | one fallback query each | that search's chunks (condense fallback only) |
+| `generate` | the full prompt as messages (system prompt with numbered context, history, question) | the model's raw answer, model, temperature, input/output tokens, time to first token (streaming). WARNING `cancelled` if the stream was cut off. |
+
+**Trace fields:** session ID, `user_id` (empty until the app has users), tags (LLM provider), version (= prompt version), and metadata: `request_id`, `prompt_version`, `prompt_sha`, `llm_provider`, `llm_model`, `embedding_model`, `index`, `k`, `min_score`. `request_id` matches the logs, and every log line of a traced request also carries `trace_id`, so you can go from either one to the other.
+
+Bump `PROMPT_VERSION` in `app/rag.py` when you change a prompt. `prompt_sha` changes automatically, so a forgotten bump still shows.
+
+**Debugging a bad answer:** open the trace (filter by `request_id` in metadata, or by session), then check:
+- `condense`: was the question rewritten correctly?
+- `retrieve`: were the right chunks found, above the threshold?
+- `generate`: what exactly did the model receive?
+
+Tracing never slows down or fails a request. Spans are sent in the background, and a Langfuse outage only produces warnings in the logs.
+
+### Feedback
+
+Each answer with a `trace_id` gets 👍 / 👎 buttons, and after a click an optional comment box (up to 500 characters). The frontend calls `POST /api/feedback`, which stores a `user_feedback` score (`1` or `-1`, with the comment) on the trace. You can find it in the **Scores** tab or filter traces by it.
+
+- **Changing your mind:** rating the same answer again replaces its score. The score ID is derived from the trace ID, so there's never a duplicate.
+- **Restored history:** `trace_id` is saved with each answer, so answers in restored history can still be rated.
+- **Who can rate a trace:** there is no login yet, so possessing the `trace_id` is the permission. It's 128 random bits and only ever sent to the client that asked the question. Once there are users, ownership can be checked against `user_id`.
+- **Rate limit:** feedback has its own per-IP counter (`FEEDBACK_RATE_LIMIT_PER_IP_PER_MINUTE`, default 30), so rating answers never uses up the chat allowance.
+
+### Privacy: what is sent to Langfuse
+
+Traces contain **text**: questions, chat history, the prompt and the answer. Before anything leaves the app, `mask_pii` in `app/tracing.py` replaces:
+
+| Pattern | Becomes |
+|---|---|
+| email addresses | `[EMAIL]` |
+| Indian mobile numbers (`+91 98765 43210`, `09876543210`, `9876543210`) and international numbers starting with `+` | `[PHONE]` |
+| Aadhaar numbers (12 digits, optionally `1234 5678 9012`) | `[AADHAAR]` |
+| PAN (`ABCDE1234F`, any case) | `[PAN]` |
+
+It applies to every observation's input, output and metadata, and to feedback comments. Numbers such as doses, pages, years and scores are left alone. If the masking code itself ever fails, the SDK sends a placeholder instead of the value, so a bug can't leak unmasked text.
+
+**Masking is pattern-based and does not catch everything.** Names, addresses and free-text health details are still sent. Langfuse is therefore a processor of users' health questions. Use the EU region, keep retention short (below), and leave `TRACING_ENABLED=false` wherever that isn't acceptable. Tracing is independent of `LOG_CONTENT`: the logs still never contain text.
+
+### Retention policy
+
+**Traces and their feedback scores are kept for 30 days, then deleted.**
+
+Langfuse's built-in **Data Retention** setting is only on paid plans (Pro/Enterprise) and self-hosted Enterprise. On the free Hobby plan, data older than 30 days is only *hidden* in the UI, not deleted. Until the deletion is scheduled, run the retention script by hand, at least weekly:
+
+```bash
+# 1. Dry run: counts the traces older than LANGFUSE_RETENTION_DAYS (30), deletes nothing
+python -m scripts.langfuse_retention
+
+# 2. Delete them (permanent)
+python -m scripts.langfuse_retention --yes
+
+# Other period, e.g. 14 days
+python -m scripts.langfuse_retention --days 14 --yes
+
+# In Docker
+docker compose run --rm --entrypoint python api -m scripts.langfuse_retention --yes
+```
+
+The script finds traces whose root observation started before the cutoff and deletes them through the Langfuse API in batches of 100. It prints counts only, never content. Langfuse deletes the data in the background, so the traces can take a few minutes to disappear from the UI.
+
+On a paid plan, set **Project Settings → Data Retention** to 30 days instead, and stop running the script.
 
 ## Logging
 
-Logs are JSON, one object per line on stdout (`LOG_FORMAT=console` gives readable output in a terminal). Every line has `timestamp`, `level`, `logger`, `pid`, `event`, and, during a request, `request_id` and `session_id`.
+Logs are JSON, one object per line on stdout (`LOG_FORMAT=console` gives readable output in a terminal). Every line has `timestamp`, `level`, `logger`, `pid`, `event`, and, during a request, `request_id`, `session_id` and (when tracing is on) `trace_id`.
 
 **Request IDs.** Each request gets an ID. If the client sends a header `X-Request-ID` made of letters, digits and `. _ : -` (at most 128 characters), that ID is reused; anything else is replaced, so a client can't forge log lines. The ID is returned in the `X-Request-ID` response header, including on errors, and in SSE `error` events; the frontend shows its first 8 characters as `ref:`. nginx creates or forwards the same ID, so its access log matches the app's lines.
 
@@ -268,7 +371,7 @@ jq -c 'select(.event == "llm_done") | {latency_ms, input_tokens, output_tokens}'
 
 - User questions, rewritten questions and answers are **never** logged. As a safety net, each request's question and rewrite are replaced with `[question]` wherever else they show up, such as in an exception message.
 - `LOG_CONTENT=true` adds `question` (to `request_started`) and `condensed_question` (to `query_condensed`). It is for **local development only**, and startup logs a warning when it's on. Answers are still not logged.
-- API keys are always redacted, in our logs and in third-party ones (uvicorn, redis, langchain, ...), including tracebacks. That covers the configured Pinecone/OpenAI keys, `pcsk_…`/`sk-…` keys, `Bearer` tokens, passwords in URLs, and fields named like `api_key`, `password`, `secret` or `token`.
+- API keys are always redacted, in our logs and in third-party ones (uvicorn, redis, langchain, ...), including tracebacks. That covers the configured Pinecone/OpenAI/Langfuse keys, `pcsk_…`/`sk-…`/`pk-lf-…` keys, `Bearer` tokens, passwords in URLs, and fields named like `api_key`, `password`, `secret` or `token`.
 
 ## Tests
 
@@ -286,3 +389,5 @@ REDIS_URL=redis://localhost:6379/15 pytest -q -m redis
 ```
 
 The tests use a unique key prefix and never touch existing keys.
+
+To check each feature by hand on the real stack (several workers/containers, request IDs, rate limits, Langfuse tracing and feedback), follow [NOTES.md](NOTES.md).
