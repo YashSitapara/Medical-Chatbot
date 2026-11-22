@@ -1,11 +1,13 @@
 """Retrieval-augmented generation: query condensing, retrieval, citations, streaming."""
 
 import asyncio
+import hashlib
 import re
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from langchain_core.documents import Document
@@ -28,6 +30,7 @@ from app.errors import (
 from app.memory import to_langchain
 from app.request_context import mark_sensitive, set_outcome
 from app.schemas import Citation, Message
+from app.tracing import Span, current_trace
 
 logger = structlog.get_logger(__name__)
 
@@ -72,6 +75,13 @@ CONDENSE_HUMAN = (
     "Follow-up question: {question}\n"
     "Standalone question:"
 )
+
+# Bump PROMPT_VERSION whenever SYSTEM_PROMPT, CONDENSE_* or format_context changes. Both go
+# into every Langfuse trace; PROMPT_SHA changes by itself, so a forgotten bump still shows.
+PROMPT_VERSION = "1"
+PROMPT_SHA = hashlib.sha256(
+    "\n\0".join([SYSTEM_PROMPT, CONDENSE_PROMPT, CONDENSE_HUMAN]).encode()
+).hexdigest()[:8]
 
 answer_prompt = ChatPromptTemplate.from_messages(
     [
@@ -201,6 +211,42 @@ def clean_rewrite(text: str, question: str) -> str | None:
     return None if reason else line
 
 
+def _usage(usage: dict | None) -> dict[str, int] | None:
+    """LangChain usage_metadata -> Langfuse usage_details."""
+    if not usage:
+        return None
+    details = {"input": usage.get("input_tokens"), "output": usage.get("output_tokens")}
+    return {k: int(v) for k, v in details.items() if v is not None} or None
+
+
+_ROLES = {"human": "user", "ai": "assistant", "system": "system"}
+
+
+def prompt_messages(prompt_value) -> list[dict[str, str]]:
+    """The exact messages sent to the model, as [{role, content}] for the trace."""
+    return [
+        {"role": _ROLES.get(m.type, m.type), "content": m.content if isinstance(m.content, str) else str(m.content)}
+        for m in prompt_value.to_messages()
+    ]
+
+
+def chunk_records(results: list[tuple[Document, float]], min_score: float, kind: str | None = None) -> list[dict]:
+    """What the trace shows per chunk: id, score, page, source, and whether it passed the threshold."""
+    records = []
+    for doc, score in results:
+        record = {
+            "id": doc.id,
+            "score": round(float(score), 4),
+            "page": _page(doc),
+            "source": _source(doc),
+            "passed": float(score) >= min_score,
+        }
+        if kind:
+            record["query_kind"] = kind
+        records.append(record)
+    return records
+
+
 def build_citations(results: list[tuple[Document, float | None]], answer: str = "") -> list[Citation]:
     used = cited_ids(answer)
     citations = []
@@ -310,7 +356,8 @@ class RAGService:
         self.min_score = settings.min_relevance_score
         self.llm = llm or build_llm(settings)
         self.vectorstore = vectorstore or build_vectorstore(settings)
-        self._condense_chain = condense_prompt | self.llm | StrOutputParser()
+        # Ends at the AIMessage (not a string) so the trace gets the rewrite's token usage.
+        self._condense_chain = condense_prompt | self.llm
         # tenacity backoff between Pinecone attempts (seconds); tests set these to 0.
         self.retry_backoff_initial = 0.2
         self.retry_backoff_max = 2.0
@@ -330,17 +377,33 @@ class RAGService:
         Logs `query_condensed` (metadata only; the text itself only with LOG_CONTENT).
         """
         start = time.perf_counter()
+        trace = current_trace()
         if not history:
             plan = RetrievalPlan("skipped", question)
+            trace.span("condense", input={"question": question}).end(
+                output={"strategy": "skipped", "standalone_question": question}
+            )
+            trace.annotate(condense_strategy=plan.strategy)
             self._log_condensed(question, plan, history, start)
             return plan
 
+        transcript = format_transcript(history)
+        span = trace.span(
+            "condense",
+            as_type="generation",
+            input={"transcript": transcript, "question": question},
+            model=self.settings.llm_model_name,
+            model_parameters={"temperature": self.settings.llm_temperature},
+        )
         raw: str | None = None
+        usage = None
         try:
-            raw = await asyncio.wait_for(
-                self._condense_chain.ainvoke({"transcript": format_transcript(history), "question": question}),
+            message = await asyncio.wait_for(
+                self._condense_chain.ainvoke({"transcript": transcript, "question": question}),
                 self.settings.condense_timeout_seconds,
             )
+            usage = getattr(message, "usage_metadata", None)
+            raw = StrOutputParser().invoke(message)
             standalone, reason = check_rewrite(raw, question)
         except TimeoutError:
             reason = "timeout"
@@ -358,6 +421,20 @@ class RAGService:
             extra = {"rewrite_raw": raw.strip()[:200]} if (raw and self.settings.log_content) else {}
             logger.warning("rewrite_rejected", reason=reason, **extra)
             plan = RetrievalPlan("fallback_dual", question, previous_question=previous or None, reason=reason)
+        fields: dict[str, Any] = {
+            "output": {
+                "strategy": plan.strategy,
+                "standalone_question": plan.query if plan.strategy == "llm" else None,
+                "reason": plan.reason,
+                "raw_rewrite": raw,  # kept even when rejected: that's the "why"
+                "previous_question": plan.previous_question,
+            },
+            "usage_details": _usage(usage),
+        }
+        if plan.reason:
+            fields.update(level="WARNING", status_message=f"rewrite rejected: {plan.reason}")
+        span.end(**fields)
+        trace.annotate(condense_strategy=plan.strategy)
         self._log_condensed(question, plan, history, start)
         return plan
 
@@ -374,12 +451,23 @@ class RAGService:
             **extra,
         )
 
-    async def retrieve(self, query: str, kind: str = "standalone") -> list[tuple[Document, float]]:
+    async def retrieve(
+        self, query: str, kind: str = "standalone", parent: Span | None = None
+    ) -> list[tuple[Document, float]]:
         """Embed locally, query Pinecone (timeout + retries), keep chunks above the threshold."""
         start = time.perf_counter()
-        # Local CPU work, deterministic: no timeout/retry needed. Off the event loop.
-        vector = await asyncio.to_thread(self.vectorstore.embeddings.embed_query, query)
-        response = await self._query_index(vector)
+        if parent is not None:  # one of the two condense-fallback searches
+            span = parent.child(f"retrieve.{kind}", as_type="retriever", input={"query": query, "query_kind": kind})
+        else:
+            span = current_trace().span("retrieve", as_type="retriever", input={"query": query, "query_kind": kind})
+        attempts = {"n": 0}
+        try:
+            # Local CPU work, deterministic: no timeout/retry needed. Off the event loop.
+            vector = await asyncio.to_thread(self.vectorstore.embeddings.embed_query, query)
+            response = await self._query_index(vector, attempts)
+        except BaseException as exc:
+            span.end(level="ERROR", status_message=type(exc).__name__, metadata={"attempts": attempts["n"]})
+            raise
         results = self._to_documents(response)
         kept = [(doc, score) for doc, score in results if score >= self.min_score]
         scores = [round(float(score), 3) for _, score in results]  # before filtering: shows what was cut
@@ -393,9 +481,14 @@ class RAGService:
             scores=scores,
             latency_ms=_ms_since(start),
         )
+        # Chunks below the threshold are shown too (passed: false): "why was nothing found?"
+        span.end(
+            output={"chunks": chunk_records(results, self.min_score)},
+            metadata={"k": self.k, "min_score": self.min_score, "attempts": attempts["n"], "query_kind": kind},
+        )
         return kept
 
-    async def _query_index(self, vector: list[float]):
+    async def _query_index(self, vector: list[float], attempts: dict | None = None):
         """One Pinecone query: per-attempt timeout, retried on timeouts/connection errors/5xx.
 
         Not PineconeVectorStore.similarity_search_with_score: it can't pass a request timeout,
@@ -430,6 +523,8 @@ class RAGService:
                 reraise=True,
             ):
                 with attempt:
+                    if attempts is not None:
+                        attempts["n"] = attempt.retry_state.attempt_number
                     return await asyncio.wait_for(asyncio.to_thread(query), timeout)
         except Exception as exc:
             if is_transient_pinecone_error(exc):  # retries exhausted -> 503
@@ -459,17 +554,34 @@ class RAGService:
         queries = [("plain", question)]
         if previous_question:
             queries.append(("combined", f"{previous_question} {question}"))
-        outcomes = await asyncio.gather(*(self.retrieve(q, kind=k) for k, q in queries), return_exceptions=True)
+        span = current_trace().span(
+            "retrieve",
+            as_type="retriever",
+            input={"queries": [{"query_kind": k, "query": q} for k, q in queries]},
+            metadata={"strategy": "fallback_dual"},
+        )
+        outcomes = await asyncio.gather(
+            *(self.retrieve(q, kind=k, parent=span) for k, q in queries), return_exceptions=True
+        )
         ok = [r for r in outcomes if not isinstance(r, BaseException)]
+        failed = [k for (k, _), r in zip(queries, outcomes) if isinstance(r, BaseException)]
         if not ok:
-            raise next(r for r in outcomes if isinstance(r, BaseException))
+            error = next(r for r in outcomes if isinstance(r, BaseException))
+            span.end(level="ERROR", status_message=type(error).__name__)
+            raise error
         best: dict[str, tuple[Document, float]] = {}
         for results in ok:
             for doc, score in results:
                 key = doc.id or doc.page_content[:100]
                 if key not in best or score > best[key][1]:
                     best[key] = (doc, score)
-        return sorted(best.values(), key=lambda x: x[1], reverse=True)[: self.k]
+        merged = sorted(best.values(), key=lambda x: x[1], reverse=True)[: self.k]
+        span.end(
+            output={"chunks": chunk_records(merged, self.min_score)},
+            metadata={"strategy": "fallback_dual", "k": self.k, "min_score": self.min_score, "failed_queries": failed},
+            **({"level": "WARNING", "status_message": f"search failed: {', '.join(failed)}"} if failed else {}),
+        )
+        return merged
 
     def _log_llm(self, start: float, usage: dict | None, ttft_ms: float | None = None) -> None:
         extra = {"ttft_ms": ttft_ms} if ttft_ms is not None else {}
@@ -507,11 +619,28 @@ class RAGService:
             set_outcome("no_context")
             return NO_CONTEXT_ANSWER, []
         start = time.perf_counter()
-        with _llm_errors("answer"):
-            message = await self.llm.ainvoke(prompt_value)
-        self._log_llm(start, getattr(message, "usage_metadata", None))
-        answer = normalize_citations(StrOutputParser().invoke(message).strip(), len(results))
+        span = self._generation_span(prompt_value)
+        try:
+            with _llm_errors("answer"):
+                message = await self.llm.ainvoke(prompt_value)
+        except BaseException as exc:
+            span.end(level="ERROR", status_message=type(exc).__name__)
+            raise
+        usage = getattr(message, "usage_metadata", None)
+        self._log_llm(start, usage)
+        raw = StrOutputParser().invoke(message)
+        span.end(output=raw, usage_details=_usage(usage))
+        answer = normalize_citations(raw.strip(), len(results))
         return answer, build_citations(results, answer)
+
+    def _generation_span(self, prompt_value) -> Span:
+        return current_trace().span(
+            "generate",
+            as_type="generation",
+            input=prompt_messages(prompt_value),  # exactly what the model received
+            model=self.settings.llm_model_name,
+            model_parameters={"temperature": self.settings.llm_temperature},
+        )
 
     async def stream(self, question: str, history: list[Message]) -> AsyncIterator[StreamEvent]:
         results, prompt_value = await self._prepare(question, history)
@@ -527,16 +656,29 @@ class RAGService:
         start = time.perf_counter()
         ttft_ms = None
         merged = None  # chunks add up; token usage arrives on the last one
-        with _llm_errors("stream"):
-            async for chunk in self.llm.astream(prompt_value):
-                merged = chunk if merged is None else merged + chunk
-                text = chunk.content if isinstance(chunk.content, str) else ""
-                if text:
-                    if ttft_ms is None:
-                        ttft_ms = _ms_since(start)
-                    parts.append(text)
-                    yield StreamEvent("token", text)
-        self._log_llm(start, getattr(merged, "usage_metadata", None), ttft_ms=ttft_ms)
+        span = self._generation_span(prompt_value)
+        completed = False
+        try:
+            with _llm_errors("stream"):
+                async for chunk in self.llm.astream(prompt_value):
+                    merged = chunk if merged is None else merged + chunk
+                    text = chunk.content if isinstance(chunk.content, str) else ""
+                    if text:
+                        if ttft_ms is None:
+                            ttft_ms = _ms_since(start)
+                            span.update(completion_start_time=datetime.now(timezone.utc))
+                        parts.append(text)
+                        yield StreamEvent("token", text)
+            completed = True
+        except Exception as exc:
+            span.end(level="ERROR", status_message=type(exc).__name__, output="".join(parts) or None)
+            raise
+        finally:
+            if not completed:  # closed early (overall cap reached, client gone); no-op after an error
+                span.end(level="WARNING", status_message="cancelled", output="".join(parts) or None)
+        usage = getattr(merged, "usage_metadata", None)
+        self._log_llm(start, usage, ttft_ms=ttft_ms)
+        span.end(output="".join(parts), usage_details=_usage(usage))
 
         # Tokens were streamed raw; the final (stored, re-rendered) text uses the [1][3] form.
         answer = normalize_citations("".join(parts).strip(), len(results))

@@ -13,6 +13,7 @@ import time
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 from starlette.datastructures import Headers, MutableHeaders
@@ -33,6 +34,8 @@ class RequestContext:
     request_id: str
     session_id: str | None = None
     outcome: str | None = None
+    trace_id: str | None = None  # Langfuse trace (app/tracing.py), logged on every later line
+    trace: Any = field(default=None, repr=False)  # the RequestTrace the RAG layer adds spans to
     # Exact texts (question, rewritten question) scrubbed from every log line. Never logged.
     sensitive: set[str] = field(default_factory=set, repr=False)
 

@@ -13,6 +13,9 @@ structlog==26.1.0
 # --- Retries (Pinecone retrieval) ---
 tenacity==9.2.1
 
+# --- Tracing + feedback (TRACING_ENABLED) ---
+langfuse==5.2.0                  # brings opentelemetry-sdk / exporter-otlp-proto-http
+
 # --- RAG / LangChain ---
 langchain-core==0.3.86
 langchain-community==0.3.26      # PyPDFLoader / DirectoryLoader

@@ -24,7 +24,8 @@ ALWAYS_DROPPED_FIELDS = frozenset({"answer"})
 _SECRET_KEY = re.compile(r"(api_?key|apikey|password|passwd|secret|token|authorization|auth)", re.IGNORECASE)
 _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"pcsk_[A-Za-z0-9_\-]+"), "[REDACTED]"),                      # Pinecone keys
-    (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"), "[REDACTED]"),                  # OpenAI keys
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"), "[REDACTED]"),                  # OpenAI / Langfuse secret keys
+    (re.compile(r"\bpk-lf-[A-Za-z0-9_\-]+"), "[REDACTED]"),                    # Langfuse public keys
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"), "Bearer [REDACTED]"),
     (re.compile(r"\b([a-z][a-z0-9+.\-]*://[^:/@\s]*:)[^@\s]+@", re.IGNORECASE), r"\1***@"),  # URL passwords
     (re.compile(r"(?i)\b(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}]+"), r"\1[REDACTED]"),
@@ -37,6 +38,8 @@ def _merge_request_context(_, __, event_dict: dict) -> dict:
         event_dict.setdefault("request_id", ctx.request_id)
         if ctx.session_id:
             event_dict.setdefault("session_id", ctx.session_id)
+        if ctx.trace_id:
+            event_dict.setdefault("trace_id", ctx.trace_id)  # links this log line to Langfuse
     return event_dict
 
 
@@ -106,6 +109,8 @@ def configure_logging(settings: Settings, stream: TextIO | None = None) -> None:
     secrets = [settings.pinecone_api_key.get_secret_value()]
     if settings.openai_api_key:
         secrets.append(settings.openai_api_key.get_secret_value())
+    if settings.langfuse_secret_key:
+        secrets.append(settings.langfuse_secret_key.get_secret_value())
     renderer = (
         structlog.dev.ConsoleRenderer()
         if settings.log_format == "console"
