@@ -215,7 +215,8 @@ def test_stream_over_the_cap_sends_timeout_event_and_saves_nothing(caplog):
     assert r.status_code == 200  # already streaming when the cap hit
     assert "token" in [e for e, _ in events]
     assert events[-1] == ("error", {"detail": "The request took too long. Please try again.",
-                                    "code": "timeout", "request_id": r.headers["X-Request-ID"]})
+                                    "code": "timeout", "request_id": r.headers["X-Request-ID"],
+                                    "trace_id": None})  # tracing off in tests
     assert not asyncio.run(memory.exists("s"))
     assert events_named(caplog, "request_finished")[-1]["outcome"] == "timeout"
 

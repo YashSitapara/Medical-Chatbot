@@ -9,6 +9,7 @@ os.environ.setdefault("PINECONE_API_KEY", "test-key")
 os.environ["LLM_PROVIDER"] = "ollama"
 os.environ.pop("MEMORY_BACKEND", None)  # REDIS_URL is kept: it only enables the -m redis tests
 os.environ["RATE_LIMIT_ENABLED"] = "false"  # tests/test_rate_limit.py enables it explicitly
+os.environ["TRACING_ENABLED"] = "false"  # tests/test_tracing.py injects a tracer with an in-memory exporter
 
 import pytest
 from fastapi.testclient import TestClient
