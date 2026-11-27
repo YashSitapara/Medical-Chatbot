@@ -10,6 +10,8 @@ Retrieval uses Pinecone with `all-MiniLM-L6-v2` embeddings. Generation uses a lo
 
 > For information only. This is not a substitute for professional medical advice.
 
+Release history: see [CHANGELOG.md](CHANGELOG.md) (current version: `app/__init__.py`, also shown at `/docs`).
+
 ## Project layout
 
 ```
@@ -78,10 +80,10 @@ The API containers reach Ollama on your host at `host.docker.internal:11434`. Th
 | `POST` | `/api/chat` | `{message, session_id?}` → `{session_id, answer, citations[], trace_id}`. Rate limited. |
 | `POST` | `/api/chat/stream` | Same body, streamed back as SSE (see below). Rate limited. |
 | `POST` | `/api/feedback` | `{trace_id, rating: 1 \| -1, comment?}` → 202. 👍/👎 on an answer, stored on its Langfuse trace. 503 `tracing_disabled` when tracing is off. Rate limited (own counter). |
-| `GET` | `/api/sessions/{id}/history` | Messages in the session (404 if unknown or expired) |
-| `DELETE` | `/api/sessions/{id}` | Clear the session |
+| `GET` | `/api/sessions/{id}/history` | Messages in the session (404 if unknown or expired, 422 if `id` isn't a UUID4) |
+| `DELETE` | `/api/sessions/{id}` | Clear the session (422 if `id` isn't a UUID4) |
 
-Leave out `session_id` to start a new conversation. The response includes the new id.
+Leave out `session_id` to start a new conversation. The response includes the new id, a random UUID4 issued by the server. Send that id back for follow-ups. Any other value (`"test"`, `"user1"`, an upper-case or non-v4 UUID) is rejected with **422** `validation_error`, because session ids act as bearer tokens (see [Privacy](#privacy-session-ids)).
 
 Each citation looks like this:
 
@@ -214,7 +216,7 @@ Every error response has the same body: `{"detail": "...", "code": "...", "reque
 | 500 | `internal_error` | A bug in our code, or our configuration (e.g. the LLM or Pinecone rejects the API key). Not retried. |
 | 429 | `rate_limited` | See below. |
 | 503 | `tracing_disabled` / `feedback_unavailable` | `POST /api/feedback` only: tracing is off, or the score could not be queued. |
-| 404 / 422 | `not_found` / `validation_error` | Unknown session or route / invalid request body. |
+| 404 / 422 | `not_found` / `validation_error` | Unknown session or route / invalid request body or a session id that isn't a server-issued UUID4. |
 
 A partial streamed answer is never saved to chat history.
 
@@ -227,7 +229,7 @@ Each request counts against two counters in Redis:
 - `ratelimit:session:{session_id}:{minute}`: `RATE_LIMIT_PER_MINUTE` (10), when the request has a session;
 - `ratelimit:ip:{ip}:{minute}`: `RATE_LIMIT_PER_IP_PER_MINUTE` (30).
 
-The per-IP counter exists because `session_id` comes from the client: a script could send a new one with every request. It is higher than the per-session limit so several people behind one NAT can still chat.
+The per-IP counter exists because `session_id` comes from the client: it must be UUID-shaped, but a script could still send a new random one with every request. It is higher than the per-session limit so several people behind one NAT can still chat.
 
 Each counter is `INCR` + `EXPIRE 60 NX` in one transaction. Over a limit: **429** with `Retry-After` (seconds left in the minute). Every chat response has `X-RateLimit-Limit` and `X-RateLimit-Remaining` for the counter closest to its limit.
 
@@ -251,6 +253,7 @@ See [.env.example](.env.example) for every setting. The main ones:
 - `LOG_LEVEL`, `LOG_FORMAT` (`json` | `console`), `LOG_CONTENT`: see [Logging](#logging).
 - Timeouts and retries: see [Timeouts, retries and errors](#timeouts-retries-and-errors). Rate limits: see [Rate limiting](#rate-limiting).
 - `TRACING_ENABLED`, `LANGFUSE_*`: see [Tracing & feedback](#tracing--feedback-langfuse).
+- `CORS_ORIGINS`: browser origins allowed to call the API cross-origin. **Default: none.** The bundled UI is served from the same origin and needs nothing. Add origins explicitly, e.g. `CORS_ORIGINS=["http://localhost:3000"]`. Avoid `["*"]`: session ids are bearer tokens.
 
 ## Tracing & feedback (Langfuse)
 
@@ -301,6 +304,10 @@ Each answer with a `trace_id` gets 👍 / 👎 buttons, and after a click an opt
 - **Restored history:** `trace_id` is saved with each answer, so answers in restored history can still be rated.
 - **Who can rate a trace:** there is no login yet, so possessing the `trace_id` is the permission. It's 128 random bits and only ever sent to the client that asked the question. Once there are users, ownership can be checked against `user_id`.
 - **Rate limit:** feedback has its own per-IP counter (`FEEDBACK_RATE_LIMIT_PER_IP_PER_MINUTE`, default 30), so rating answers never uses up the chat allowance.
+
+### Privacy: session IDs
+
+**Session IDs are unguessable and act as bearer tokens.** The server issues a random UUID4 for each new conversation, and the API rejects any other value with 422, in the chat body and in `/api/sessions/{id}/…`. A client therefore can't pick a guessable id like `user1` that someone else could read. Anyone who holds a session id can read and delete that conversation, so treat it like a password: the UI keeps it in the browser's `localStorage`, and it shouldn't be pasted into shared places. `trace_id` works the same way for `POST /api/feedback`.
 
 ### Privacy: what is sent to Langfuse
 

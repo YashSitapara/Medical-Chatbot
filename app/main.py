@@ -9,13 +9,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Path as PathParam
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import structlog
+from typing_extensions import Annotated
 
+from app import __version__
 from app.config import Settings, get_settings
 from app.log_config import configure_logging
 from app.errors import DependencyUnavailableError, RequestTimeoutError
@@ -32,6 +35,7 @@ from app.request_context import (
     set_session,
 )
 from app.schemas import (
+    SESSION_ID_PATTERN,
     ChatRequest,
     ChatResponse,
     FeedbackRequest,
@@ -105,7 +109,7 @@ async def lifespan(app: FastAPI):
             hint="Each worker keeps its own chat history, so follow-ups may lose context. "
             "Set MEMORY_BACKEND=redis to share it.",
         )
-    logger.info("startup_complete")
+    logger.info("startup_complete", version=__version__)
     yield
     await memory.close()
     if limiter is not None:
@@ -206,12 +210,16 @@ def _sse(event: str, data) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+# Path parameter version of ChatRequest.session_id: anything that isn't a UUID4 is a 422.
+SessionId = Annotated[str, PathParam(pattern=SESSION_ID_PATTERN, description="Server-issued session id (UUID4).")]
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings)
     app = FastAPI(
         title="Medical RAG Chatbot",
-        version="1.1.0",
+        version=__version__,
         description="Question answering over medical documents with citations, streaming and chat memory.",
         lifespan=lifespan,
     )
@@ -252,13 +260,14 @@ def create_app() -> FastAPI:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=[REQUEST_ID_HEADER, *RATE_LIMIT_HEADERS],  # lets browser JS read them
-    )
+    if settings.cors_origins:  # default: none; the bundled UI is same-origin and needs no CORS
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=[REQUEST_ID_HEADER, *RATE_LIMIT_HEADERS],  # lets browser JS read them
+        )
     # Added last = outermost: wraps CORS too, so every response (even preflight) gets an ID.
     app.add_middleware(RequestContextMiddleware)
 
@@ -473,14 +482,14 @@ def create_app() -> FastAPI:
         return FeedbackResponse()
 
     @app.get("/api/sessions/{session_id}/history", response_model=HistoryResponse, tags=["sessions"])
-    async def get_history(session_id: str, memory: ChatMemory = Depends(get_memory)) -> HistoryResponse:
+    async def get_history(session_id: SessionId, memory: ChatMemory = Depends(get_memory)) -> HistoryResponse:
         set_session(session_id)
         if not await memory.exists(session_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
         return HistoryResponse(session_id=session_id, messages=await memory.get(session_id))
 
     @app.delete("/api/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["sessions"])
-    async def delete_session(session_id: str, memory: ChatMemory = Depends(get_memory)) -> Response:
+    async def delete_session(session_id: SessionId, memory: ChatMemory = Depends(get_memory)) -> Response:
         set_session(session_id)
         await memory.clear(session_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)

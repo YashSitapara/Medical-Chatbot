@@ -1,6 +1,6 @@
 import json
 
-from tests.conftest import run
+from tests.conftest import run, SID, new_sid
 
 
 def parse_sse(text: str) -> list[tuple[str, object]]:
@@ -88,11 +88,11 @@ def _pinecone_down(store, times=3):
 def test_stream_error_event(make_client):
     client, store, memory = make_client(["unused"])
     _pinecone_down(store)
-    with client.stream("POST", "/api/chat/stream", json={"message": "q", "session_id": "s1"}) as r:
+    with client.stream("POST", "/api/chat/stream", json={"message": "q", "session_id": SID}) as r:
         events = parse_sse(r.read().decode())
     assert [e for e, _ in events] == ["session", "error"]
     assert events[-1][1]["code"] == "dependency_unavailable" and events[-1][1]["request_id"]
-    assert not run(memory.exists("s1"))
+    assert not run(memory.exists(SID))
 
 
 def test_chat_returns_503_on_backend_failure(make_client):
@@ -105,7 +105,7 @@ def test_chat_returns_503_on_backend_failure(make_client):
 
 def test_history_404_and_delete(make_client):
     client, _, _ = make_client(["A [1]."])
-    assert client.get("/api/sessions/missing/history").status_code == 404
+    assert client.get(f"/api/sessions/{new_sid()}/history").status_code == 404
     sid = client.post("/api/chat", json={"message": "q"}).json()["session_id"]
     assert client.delete(f"/api/sessions/{sid}").status_code == 204
     assert client.get(f"/api/sessions/{sid}/history").status_code == 404
@@ -134,3 +134,81 @@ def test_stream_done_and_memory_use_normalized_citations(make_client):
     assert [c["cited"] for c in done["citations"]][:2] == [True, True]
     stored = run(memory.get(events[0][1]["session_id"]))
     assert stored[-1].content == "Acne [1][2]."
+
+
+# --- Session ids are server-issued UUID4s (bearer tokens) -----------------------------------
+
+BAD_SESSION_IDS = [
+    "test",
+    "user1",
+    SID.upper(),                               # the server only issues lower case
+    "6fa459ea-ee8a-11ca-a2d8-08002b2b9a3d",    # UUID1 (time-based, partly guessable)
+    "-" * 36,
+    SID + "0",
+]
+
+
+def test_chat_rejects_client_chosen_session_ids(make_client):
+    client, store, memory = make_client(["A [1]."] * 20)
+    for bad in BAD_SESSION_IDS:
+        for path in ("/api/chat", "/api/chat/stream"):
+            r = client.post(path, json={"message": "What is acne?", "session_id": bad})
+            assert r.status_code == 422, (path, bad)
+            assert r.json()["code"] == "validation_error"
+            assert not run(memory.exists(bad))
+    assert store.queries == []  # rejected before any work
+
+
+def test_session_routes_reject_bad_ids(make_client):
+    client, _, _ = make_client([])
+    for bad in ("user1", "test", SID.upper()):
+        assert client.get(f"/api/sessions/{bad}/history").status_code == 422
+        assert client.delete(f"/api/sessions/{bad}").status_code == 422
+    assert client.get(f"/api/sessions/{new_sid()}/history").status_code == 404  # valid but unknown
+
+
+def test_server_issued_session_id_round_trip(make_client):
+    from app.schemas import SESSION_ID_PATTERN
+    import re
+
+    client, _, _ = make_client(["A [1].", "B [1]."])
+    sid = client.post("/api/chat", json={"message": "What is acne?"}).json()["session_id"]
+    assert re.fullmatch(SESSION_ID_PATTERN, sid)
+    assert client.post("/api/chat", json={"message": "Who gets it?", "session_id": sid}).status_code == 200
+    assert len(client.get(f"/api/sessions/{sid}/history").json()["messages"]) == 4
+
+
+# --- Version and CORS -----------------------------------------------------------------------
+
+def test_version_comes_from_package(make_client):
+    from app import __version__
+
+    client, _, _ = make_client([])
+    assert __version__ == "0.1.0"
+    assert client.get("/openapi.json").json()["info"]["version"] == __version__
+
+
+def test_cors_closed_by_default(make_client):
+    client, _, _ = make_client([])
+    r = client.get("/health", headers={"Origin": "http://evil.example"})
+    assert "access-control-allow-origin" not in r.headers
+    pre = client.options("/api/chat", headers={
+        "Origin": "http://evil.example", "Access-Control-Request-Method": "POST"})
+    assert "access-control-allow-origin" not in pre.headers
+
+
+def test_cors_allows_only_listed_origins(make_client, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("CORS_ORIGINS", '["http://localhost:3000"]')
+    get_settings.cache_clear()
+    try:
+        client, _, _ = make_client([])
+        ok = client.get("/health", headers={"Origin": "http://localhost:3000"})
+        assert ok.headers["access-control-allow-origin"] == "http://localhost:3000"
+        assert "x-request-id" in ok.headers["access-control-expose-headers"].lower()
+        other = client.get("/health", headers={"Origin": "http://evil.example"})
+        assert "access-control-allow-origin" not in other.headers
+    finally:
+        monkeypatch.delenv("CORS_ORIGINS")
+        get_settings.cache_clear()

@@ -14,7 +14,7 @@ pytest -q                                          # no network needed
 REDIS_URL=redis://localhost:6379/15 pytest -q      # + the tests that need a real Redis (DB 15)
 ```
 
-Each section ends with an **Expected** checklist. Every session ID used here starts with `verify-`, so [cleanup](#5-cleanup) can't touch real conversations.
+Each section ends with an **Expected** checklist. Every session ID used here is a test UUID starting with `00000000-0000-4000-8000-` (made by the `vsid` helper below), so [cleanup](#5-cleanup) can't touch real conversations. The API only accepts UUID4 session IDs, and real ones are random, so they never start like this. These test IDs are guessable on purpose: never use them for real chats.
 
 ---
 
@@ -43,9 +43,12 @@ export BASE=http://localhost:8000     # Docker (nginx -> api replicas)
 # export BASE=http://localhost:8001   # local uvicorn
 ```
 
-Helpers (zsh/bash). Each prints the status line, the interesting headers, then the JSON body:
+Helpers (zsh/bash). `chat` and `stream` print the status line, the interesting headers, then the JSON body:
 
 ```bash
+# vsid <n>: a test session id, e.g. vsid 101 -> 00000000-0000-4000-8000-000000000101 (a valid UUID4)
+vsid() { printf '00000000-0000-4000-8000-%012d' "$1"; }
+
 # chat "<question>" [session_id] [extra curl args...]
 chat() {
   local q="$1" sid="$2"; if [ $# -ge 2 ]; then shift 2; else shift $#; fi
@@ -98,7 +101,7 @@ for i in 1 2 3 4 5 6; do curl -s -o /dev/null -D - $BASE/health | grep -i x-upst
 **One conversation, answered by different replicas:**
 
 ```bash
-SID=verify-docker-1
+SID=$(vsid 101)
 chat "What is acne?" $SID
 chat "Who usually gets it?" $SID          # a follow-up: needs the first turn from Redis
 chat "How is it treated?" $SID
@@ -151,7 +154,7 @@ MEMORY_BACKEND=redis uvicorn app.main:app --workers 3 --port 8001 2>&1 | tee /tm
 In a second terminal (run the [setup helpers](#0-setup-once-per-terminal) again there, with `BASE=http://localhost:8001`):
 
 ```bash
-SID=verify-workers-1
+SID=$(vsid 111)
 chat "What is acne?" $SID
 for q in "Who usually gets it?" "How is it treated?" "Can it leave scars?" "Is it contagious?"; do chat "$q" $SID; done
 
@@ -173,7 +176,7 @@ for i in $(seq 6); do curl -s $BASE/api/sessions/$SID/history | jq '.messages | 
 MEMORY_BACKEND=memory uvicorn app.main:app --workers 3 --port 8001 2>&1 | tee /tmp/app-memory.log
 grep inmemory_with_multiple_workers /tmp/app-memory.log     # startup warning, one per worker
 
-SID=verify-workers-2
+SID=$(vsid 112)
 chat "What is acne?" $SID
 for i in $(seq 9); do curl -s -o /dev/null -w '%{http_code} ' $BASE/api/sessions/$SID/history; done; echo
 # → a mix of 200 and 404: only the worker that answered has the history
@@ -186,10 +189,10 @@ Stop it and go back to `MEMORY_BACKEND=redis` for the next sections.
 ```bash
 export BASE=http://localhost:8000
 docker compose pause redis
-chat "What is acne?" verify-down-1               # → 503, code: dependency_unavailable (after ~3-6 s)
+chat "What is acne?" $(vsid 121)               # → 503, code: dependency_unavailable (after ~3-6 s)
 curl -s $BASE/ready | jq -c '.status, .checks.redis'   # → "not_ready", {"ok": false, "error": "..."}
 docker compose unpause redis
-chat "What is acne?" verify-down-1               # → 200 again, nothing restarted
+chat "What is acne?" $(vsid 121)               # → 200 again, nothing restarted
 ```
 
 The Docker healthcheck marks replicas `unhealthy` only after 3 failed `/ready` probes, 30 s apart. A short pause won't show up in `docker compose ps`.
@@ -234,17 +237,21 @@ curl -s -o /dev/null -D - -H 'X-Request-ID: bad id with spaces' $BASE/health | g
 # → a fresh 32-hex id
 
 # Error bodies carry the same ID as the header:
-curl -s -D - -H 'X-Request-ID: verify-404' $BASE/api/sessions/verify-nope/history | grep -iE 'x-request-id|request_id'
+curl -s -D - -H 'X-Request-ID: verify-404' $BASE/api/sessions/$(vsid 299)/history | grep -iE 'x-request-id|request_id'
 # → header verify-404, body {"detail":"Session not found","code":"not_found","request_id":"verify-404"}
 curl -s -H 'X-Request-ID: verify-422' -H 'content-type: application/json' $BASE/api/chat -d '{}' | jq -c '{code, request_id}'
 # → {"code":"validation_error","request_id":"verify-422"}
+
+# A session id the server didn't issue (not a UUID4) is rejected: ids are bearer tokens
+curl -s -o /dev/null -w '%{http_code}\n' $BASE/api/sessions/verify-nope/history    # → 422
+chat "What is acne?" user1                                                       # → 422, code: validation_error
 ```
 
 ### 2b. Following one request through the logs
 
 ```bash
-chat "What is acne?" verify-log-1 -H 'X-Request-ID: verify-chat-1'
-chat "Who usually gets it?" verify-log-1 -H 'X-Request-ID: verify-chat-2'
+chat "What is acne?" $(vsid 201) -H 'X-Request-ID: verify-chat-1'
+chat "Who usually gets it?" $(vsid 201) -H 'X-Request-ID: verify-chat-2'
 
 jq -c 'select(.request_id=="verify-chat-2") | {event, latency_ms, condense_strategy, changed,
        chunks_retrieved, chunks_passed, top_score, input_tokens, output_tokens, status_code, outcome}
@@ -265,7 +272,7 @@ jq -c 'select(.request_id=="verify-chat-2") | {event, latency_ms, condense_strat
 
 ```bash
 MEMORY_BACKEND=redis REQUEST_TIMEOUT_SECONDS=1 uvicorn app.main:app --port 8001 2>&1 | tee /tmp/app.log
-stream "Explain acne in detail" verify-log-2
+stream "Explain acne in detail" $(vsid 202)
 # → ... error: {"detail": "The request took too long...", "code": "timeout", "request_id": "...", ...}
 jq -c 'select(.event=="request_finished") | {status_code, outcome}' /tmp/app.log | tail -1
 # → {"status_code":200,"outcome":"timeout"}   (200 was already sent; outcome tells the truth)
@@ -288,7 +295,7 @@ jq -c 'select(.event=="request_started") | {question_chars, question}' /tmp/app.
 ```bash
 MEMORY_BACKEND=redis LOG_CONTENT=true uvicorn app.main:app --port 8001 2>&1 | tee /tmp/app-content.log
 grep log_content_enabled /tmp/app-content.log                  # startup warning
-chat "What is acne?" verify-log-3
+chat "What is acne?" $(vsid 203)
 jq -c 'select(.event=="request_started" or .event=="query_condensed") | {event, question, condensed_question}' /tmp/app-content.log
 # → question / condensed_question present; answers are still never logged
 ```
@@ -305,13 +312,13 @@ curl -s $BASE/ready >/dev/null; grep -c '"route": "/ready"' /tmp/app.log    # �
 
 ```bash
 export BASE=http://localhost:8000
-chat "What is acne?" verify-log-4 -H 'X-Request-ID: verify-nginx-1'
+chat "What is acne?" $(vsid 204) -H 'X-Request-ID: verify-nginx-1'
 docker compose logs nginx | grep 'request_id=verify-nginx-1'
 # → ... "POST /api/chat HTTP/1.1" 200 ... upstream=192.168.97.x:8000 request_id=verify-nginx-1
 docker compose logs api --no-log-prefix | jq -c 'select(.request_id=="verify-nginx-1") | .event'
 
 # No X-Request-ID from the client: nginx creates one and the API uses it.
-chat "What is acne?" verify-log-4
+chat "What is acne?" $(vsid 204)
 ```
 
 ### Expected
@@ -344,7 +351,7 @@ rcli --scan --pattern 'ratelimit:*' | xargs -r docker compose exec -T redis redi
 These calls use the LLM, so they take a few seconds each. To make the test faster, ask something out of scope: "How do I bake bread?" is answered without calling the LLM.
 
 ```bash
-SID=verify-rl-1
+SID=$(vsid 301)
 for i in $(seq 11); do
   printf "%2d  " $i
   curl -s -o /tmp/verify-body -D /tmp/h $BASE/api/chat -H 'content-type: application/json' \
@@ -363,7 +370,7 @@ jq -c . /tmp/verify-body
 **The counter lives in Redis, shared by all replicas:**
 
 ```bash
-rcli --scan --pattern 'ratelimit:*'          # ratelimit:session:verify-rl-1:<minute>, ratelimit:ip:<ip>:<minute>
+rcli --scan --pattern 'ratelimit:*'          # ratelimit:session:00000000-0000-4000-8000-000000000301:<minute>, ratelimit:ip:<ip>:<minute>
 KEY=$(rcli --scan --pattern "ratelimit:session:$SID:*" | tr -d '\r')
 rcli GET $KEY                                # → 11
 rcli TTL $KEY                                # → ≤ 60, and NOT reset by later hits (EXPIRE ... NX)
@@ -383,7 +390,7 @@ chat "How do I bake bread?" $SID            # → 200, X-RateLimit-Remaining: 9
 rcli --scan --pattern 'ratelimit:*' | xargs -r docker compose exec -T redis redis-cli DEL
 for i in $(seq 31); do
   curl -s -o /dev/null -w '%{http_code} ' $BASE/api/chat -H 'content-type: application/json' \
-       -d '{"message":"How do I bake bread?","session_id":"verify-rot-'$i'"}'
+       -d '{"message":"How do I bake bread?","session_id":"'$(vsid $((310+i)))'"}'
 done; echo
 # → 30 × 200, then 429 (each session used only once: the IP counter caught it)
 docker compose logs api --no-log-prefix | jq -c 'select(.event=="rate_limited") | .limited_by' | tail -1   # → "ip"
@@ -392,7 +399,7 @@ docker compose logs api --no-log-prefix | jq -c 'select(.event=="rate_limited") 
 **A faked `X-Forwarded-For` doesn't help behind nginx.** nginx overwrites the header with the real address:
 
 ```bash
-chat "How do I bake bread?" verify-rot-99 -H 'X-Forwarded-For: 1.2.3.4'       # still 429
+chat "How do I bake bread?" $(vsid 399) -H 'X-Forwarded-For: 1.2.3.4'       # still 429
 rcli --scan --pattern 'ratelimit:ip:*'     # only the real client address, never 1.2.3.4
 ```
 
@@ -406,7 +413,7 @@ for i in $(seq 5); do curl -s -o /dev/null -D - $BASE/health | grep -ci x-rateli
 
 rcli --scan --pattern 'ratelimit:*' | xargs -r docker compose exec -T redis redis-cli DEL
 curl -s -D - -o /dev/null $BASE/api/chat/stream -H 'content-type: application/json' \
-     -d '{"message":"How do I bake bread?","session_id":"verify-rl-2"}' | grep -i x-ratelimit
+     -d '{"message":"How do I bake bread?","session_id":"'$(vsid 302)'"}' | grep -i x-ratelimit
 # → the streaming route is limited too: X-RateLimit-Limit / -Remaining present
 ```
 
@@ -417,14 +424,14 @@ for i in $(seq 31); do curl -s -o /dev/null -w '%{http_code} ' $BASE/api/feedbac
   -H 'content-type: application/json' -d '{"trace_id":"'$(printf 'a%.0s' {1..32})'","rating":1}'; done; echo
 # → 30 × (202, or 503 if tracing is off), then 429
 rcli --scan --pattern 'ratelimit:feedback:*'
-chat "How do I bake bread?" verify-rl-3      # chat still allowed: separate counter
+chat "How do I bake bread?" $(vsid 303)      # chat still allowed: separate counter
 ```
 
 ### 3d. Redis down: fail open
 
 ```bash
 docker compose pause redis
-chat "How do I bake bread?" verify-rl-4
+chat "How do I bake bread?" $(vsid 304)
 docker compose logs api --no-log-prefix --since 1m | jq -c 'select(.event=="rate_limit_unavailable" or .event=="dependency_unavailable") | {event, detail}'
 docker compose unpause redis
 ```
@@ -439,7 +446,7 @@ docker compose unpause redis
 ```bash
 # Local: no headers, never 429
 MEMORY_BACKEND=redis RATE_LIMIT_ENABLED=false uvicorn app.main:app --port 8001
-BASE=http://localhost:8001 chat "How do I bake bread?" verify-rl-5    # no X-RateLimit-* headers
+BASE=http://localhost:8001 chat "How do I bake bread?" $(vsid 305)    # no X-RateLimit-* headers
 ```
 
 ### Expected
@@ -484,7 +491,7 @@ BASE=http://localhost:8001 chat "How do I bake bread?" verify-rl-5    # no X-Rat
 
 ```bash
 export BASE=http://localhost:8000
-SID=verify-lf-1
+SID=$(vsid 401)
 chat "What is acne?" $SID                    # → body has "trace_id": "<32 hex>"
 TID=$(jq -r .trace_id /tmp/verify-body); echo $TID
 stream "Who usually gets it?" $SID           # → last line: done: {... "trace_id": "..."}
@@ -505,7 +512,7 @@ Open **Langfuse → Tracing → Traces** and click the newest `chat` trace, or s
 | `retrieve` | input `{query}`; output `chunks` with `id`, `score`, `page`, `source`, `passed`; metadata `attempts`, `k`, `min_score` |
 | `generate` | input: the full prompt (system + numbered context + history + question); output: the answer; model `gemma3:4b`, input/output tokens; time to first token on the stream |
 | Trace metadata | `request_id`, `prompt_version`, `prompt_sha`, `llm_provider`, `llm_model`, `embedding_model`, `index`, `k`, `min_score` |
-| **Sessions** tab | session `verify-lf-1` groups both traces |
+| **Sessions** tab | session `00000000-0000-4000-8000-000000000401` (`vsid 401`) groups both traces |
 
 **Find the trace for a log line:**
 
@@ -520,8 +527,8 @@ Run locally with a tiny rewrite timeout. The keys come from `.env`:
 ```bash
 export BASE=http://localhost:8001
 MEMORY_BACKEND=redis CONDENSE_TIMEOUT_SECONDS=0.01 uvicorn app.main:app --port 8001 2>&1 | tee /tmp/app.log
-chat "What is acne?" verify-lf-2
-chat "Who usually gets it?" verify-lf-2
+chat "What is acne?" $(vsid 402)
+chat "Who usually gets it?" $(vsid 402)
 ```
 
 **In that second trace:**
@@ -533,7 +540,7 @@ chat "Who usually gets it?" verify-lf-2
 
 ```bash
 export BASE=http://localhost:8000
-chat "My email is test.user@example.com, phone +91 98765 43210, PAN ABCDE1234F, Aadhaar 2345 6789 0123. What is acne?" verify-lf-3
+chat "My email is test.user@example.com, phone +91 98765 43210, PAN ABCDE1234F, Aadhaar 2345 6789 0123. What is acne?" $(vsid 403)
 ```
 
 **In that trace (the `chat` input and the `generate` prompt):**
@@ -567,19 +574,19 @@ curl -s -w ' %{http_code}\n' $BASE/api/feedback -H 'content-type: application/js
 
 ```bash
 # LLM down: stop Ollama (quit the menu-bar app, or `pkill ollama`), then:
-chat "What is acne?" verify-lf-4             # → 503 dependency_unavailable, with trace_id in logs
+chat "What is acne?" $(vsid 404)             # → 503 dependency_unavailable, with trace_id in logs
 # Trace: chat = ERROR "LLMUnavailableError", metadata.outcome = dependency_unavailable; generate = ERROR.
 # Start Ollama again afterwards.
 ```
 
-**Stream cut off by the overall cap.** Run locally with `REQUEST_TIMEOUT_SECONDS=2`, then `stream "Explain acne in detail" verify-lf-5`. In that trace the root has outcome `timeout`, and `generate` is **WARNING `cancelled`**, with the partial output kept.
+**Stream cut off by the overall cap.** Run locally with `REQUEST_TIMEOUT_SECONDS=2`, then `stream "Explain acne in detail" $(vsid 405)`. In that trace the root has outcome `timeout`, and `generate` is **WARNING `cancelled`**, with the partial output kept.
 
 ### 4g. A Langfuse outage doesn't hurt chat
 
 ```bash
 export BASE=http://localhost:8001
 MEMORY_BACKEND=redis LANGFUSE_BASE_URL=http://10.255.255.1 uvicorn app.main:app --port 8001 2>&1 | tee /tmp/app.log
-time chat "What is acne?" verify-lf-6        # normal latency, trace_id still returned
+time chat "What is acne?" $(vsid 406)        # normal latency, trace_id still returned
 sleep 20; grep -c "Failed to export spans" /tmp/app.log      # → ≥ 1: errors only in the logs
 ```
 
@@ -587,7 +594,7 @@ sleep 20; grep -c "Failed to export spans" /tmp/app.log      # → ≥ 1: errors
 
 ```bash
 MEMORY_BACKEND=redis TRACING_ENABLED=false uvicorn app.main:app --port 8001
-chat "What is acne?" verify-lf-7             # → "trace_id": null; no 👍/👎 in the UI
+chat "What is acne?" $(vsid 407)             # → "trace_id": null; no 👍/👎 in the UI
 curl -s $BASE/api/feedback -H 'content-type: application/json' -d '{"trace_id":"'$(printf 'a%.0s' {1..32})'","rating":1}' | jq -c '{code}'
 # → {"code":"tracing_disabled"} (503)
 ```
@@ -626,8 +633,8 @@ python -m scripts.langfuse_retention --days 0 --yes    # then confirm in the UI 
 ## 5. Cleanup
 
 ```bash
-# Test sessions and rate-limit counters (only verify-* sessions, never real ones)
-rcli --scan --pattern 'medical-rag:chat:verify-*' | xargs -r docker compose exec -T redis redis-cli DEL
+# Test sessions and rate-limit counters (only the vsid test sessions, never real ones)
+rcli --scan --pattern 'medical-rag:chat:00000000-0000-4000-8000-*' | xargs -r docker compose exec -T redis redis-cli DEL
 rcli --scan --pattern 'ratelimit:*'               | xargs -r docker compose exec -T redis redis-cli DEL
 rm -f /tmp/verify-headers /tmp/verify-body /tmp/h /tmp/app*.log
 
@@ -636,4 +643,4 @@ docker compose down
 docker compose up -d redis           # if you still want Redis for local runs
 ```
 
-Traces of the `verify-*` sessions stay in Langfuse. Delete them in the UI (Traces → filter by session → delete), or let the retention script remove them after 30 days.
+Traces of the test sessions (`00000000-0000-4000-8000-…`) stay in Langfuse. Delete them in the UI (Traces → filter by session → delete), or let the retention script remove them after 30 days.

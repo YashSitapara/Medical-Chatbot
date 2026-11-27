@@ -11,7 +11,7 @@ import pytest
 
 from app.main import create_app
 from app.memory import InMemoryChatMemory, MemoryUnavailableError, RedisChatMemory
-from tests.conftest import make_rag
+from tests.conftest import make_rag, new_sid
 from tests.test_api import parse_sse
 
 
@@ -107,7 +107,7 @@ async def test_stream_returns_503_before_streaming_when_redis_down(down_instance
 
 
 async def test_history_and_health_return_503_when_redis_down(down_instance):
-    assert (await down_instance.get("/api/sessions/x/history")).status_code == 503
+    assert (await down_instance.get(f"/api/sessions/{new_sid()}/history")).status_code == 503
     assert (await down_instance.get("/health")).status_code == 503
 
 

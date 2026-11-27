@@ -82,7 +82,10 @@ class Settings(BaseSettings):
     feedback_rate_limit_per_ip_per_minute: int = Field(default=30, ge=1)
 
     # --- Server ---
-    cors_origins: list[str] = ["*"]
+    # Browser origins allowed to call the API cross-origin. Default: none. The bundled UI is
+    # served from the same origin and needs nothing. Add origins explicitly, e.g.
+    # CORS_ORIGINS=["http://localhost:3000"]. Avoid ["*"]: session ids are bearer tokens.
+    cors_origins: list[str] = []
     log_level: str = "INFO"
     # "json" (one JSON object per line, for log collectors) or "console" (readable, for a terminal).
     log_format: Literal["json", "console"] = "json"

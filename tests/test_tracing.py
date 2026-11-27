@@ -24,7 +24,7 @@ from app.rag import PROMPT_SHA, PROMPT_VERSION, RAGService
 from app.rate_limit import InMemoryRateLimiter
 from app.schemas import Message
 from app.tracing import FEEDBACK_SCORE_NAME, LangfuseTracer, NoopTracer, build_tracer, mask_pii, mask_text
-from tests.conftest import OFF_TOPIC, StubVectorStore
+from tests.conftest import OFF_TOPIC, StubVectorStore, SID
 from tests.test_api import parse_sse
 from tests.test_resilience import ScriptedLLM, StallingStreamLLM
 
@@ -167,7 +167,7 @@ def test_mask_walks_containers_and_keeps_numbers():
 
 def test_chat_trace_has_condense_retrieve_generate_under_one_root(tracer, spans):
     client, _ = make_app(tracer)
-    r = client.post("/api/chat", json={"message": "What is acne?", "session_id": "sess-1"})
+    r = client.post("/api/chat", json={"message": "What is acne?", "session_id": SID})
     assert r.status_code == 200
     trace_id = r.json()["trace_id"]
     s = spans()
@@ -179,9 +179,9 @@ def test_chat_trace_has_condense_retrieve_generate_under_one_root(tracer, spans)
         child = s[name][0]
         assert child.context.trace_id == root.context.trace_id
         assert child.parent.span_id == root.context.span_id
-        assert child.attributes["session.id"] == "sess-1"
+        assert child.attributes["session.id"] == SID
 
-    assert root.attributes["session.id"] == "sess-1"
+    assert root.attributes["session.id"] == SID
     assert root.attributes["langfuse.trace.name"] == "chat"
     meta = {k.rsplit(".", 1)[1]: attr(root, k) for k in root.attributes if k.startswith("langfuse.trace.metadata.")}
     assert meta == {
@@ -241,10 +241,10 @@ def test_retrieve_records_every_chunk_with_threshold_flag(tracer, spans):
 
 def test_condense_records_history_and_rewrite(tracer, spans):
     memory = InMemoryChatMemory()
-    asyncio.run(memory.append("s", "What is acne?", "Acne is a skin disease [1]."))
+    asyncio.run(memory.append(SID, "What is acne?", "Acne is a skin disease [1]."))
     llm = FakeListChatModel(responses=["Who usually gets acne?", "Teenagers [1]."])
     client, _ = make_app(tracer, llm=llm, memory=memory)
-    client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"})
+    client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID})
     s = spans()
     cond = s["condense"][0]
     assert obs(cond, "type") == "generation"
@@ -258,11 +258,11 @@ def test_condense_records_history_and_rewrite(tracer, spans):
 
 def test_rejected_rewrite_shows_warning_and_both_searches(tracer, spans):
     memory = InMemoryChatMemory()
-    asyncio.run(memory.append("s", "What is acne?", "Acne [1]."))
+    asyncio.run(memory.append(SID, "What is acne?", "Acne [1]."))
     # The "rewrite" is an answer with a citation: rejected -> dual retrieval.
     llm = FakeListChatModel(responses=["Teenagers get acne [1].", "Teenagers [1]."])
     client, _ = make_app(tracer, llm=llm, memory=memory)
-    client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"})
+    client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID})
     s = spans()
     cond = s["condense"][0]
     assert obs(cond, "level") == "WARNING"
@@ -274,15 +274,15 @@ def test_rejected_rewrite_shows_warning_and_both_searches(tracer, spans):
     assert all(k.parent.span_id == parent.context.span_id for k in kids.values())
     assert obs(kids["retrieve.plain"], "input")["query"] == "Who gets it?"
     assert obs(kids["retrieve.combined"], "input")["query"] == "What is acne? Who gets it?"
-    assert kids["retrieve.combined"].attributes["session.id"] == "s"
+    assert kids["retrieve.combined"].attributes["session.id"] == SID
 
 
 def test_condense_timeout_is_recorded(tracer, spans):
     memory = InMemoryChatMemory()
-    asyncio.run(memory.append("s", "What is acne?", "Acne [1]."))
+    asyncio.run(memory.append(SID, "What is acne?", "Acne [1]."))
     llm = ScriptedLLM(responses=["x", "Teenagers [1]."], fail_calls=1, delay=1)
     client, _ = make_app(tracer, llm=llm, memory=memory, condense_timeout_seconds=0.05)
-    assert client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"}).status_code == 200
+    assert client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID}).status_code == 200
     cond = spans()["condense"][0]
     assert obs(cond, "level") == "WARNING" and obs(cond, "output")["reason"] == "timeout"
 
@@ -316,10 +316,10 @@ def exporter_spans(by_name):
 
 def test_pii_never_leaves_the_app(tracer, spans):
     memory = InMemoryChatMemory()
-    asyncio.run(memory.append("s", "I am priya@example.com, 9876543210", "Hello [1]."))
+    asyncio.run(memory.append(SID, "I am priya@example.com, 9876543210", "Hello [1]."))
     llm = FakeListChatModel(responses=["What is acne for PAN ABCDE1234F?", "Acne [1]."])
     client, _ = make_app(tracer, llm=llm, memory=memory)
-    client.post("/api/chat", json={"message": "What is acne? Aadhaar 2345 6789 0123", "session_id": "s"})
+    client.post("/api/chat", json={"message": "What is acne? Aadhaar 2345 6789 0123", "session_id": SID})
     everything = json.dumps([dict(sp.attributes) for sp in exporter_spans(spans())], default=str)
     for raw in ("priya@example.com", "9876543210", "ABCDE1234F", "2345 6789 0123"):
         assert raw not in everything
@@ -379,8 +379,8 @@ def test_stream_provider_error_marks_generation(tracer, spans):
 
 def test_history_keeps_trace_id_and_old_messages_still_load(tracer, spans):
     client, memory = make_app(tracer)
-    r = client.post("/api/chat", json={"message": "What is acne?", "session_id": "h"})
-    messages = client.get("/api/sessions/h/history").json()["messages"]
+    r = client.post("/api/chat", json={"message": "What is acne?", "session_id": SID})
+    messages = client.get(f"/api/sessions/{SID}/history").json()["messages"]
     assert messages[0]["trace_id"] is None and messages[1]["trace_id"] == r.json()["trace_id"]
     old = '{"role": "assistant", "content": "hi", "created_at": "2026-01-01T00:00:00Z"}'
     assert Message.model_validate_json(old).trace_id is None

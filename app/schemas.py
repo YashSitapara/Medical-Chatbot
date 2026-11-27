@@ -8,6 +8,11 @@ from typing_extensions import Annotated
 
 MessageText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 
+# Session ids are issued by the server (str(uuid.uuid4())) and act as bearer tokens: whoever
+# holds one can read that conversation. Accepting only random UUID4s means a client can't pick
+# a guessable id like "test" or "user1" that someone else could read.
+SESSION_ID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -17,8 +22,8 @@ class ChatRequest(BaseModel):
     message: MessageText = Field(description="The user's question.")
     session_id: str | None = Field(
         default=None,
-        max_length=64,
-        description="Conversation id. Omit to start a new conversation.",
+        pattern=SESSION_ID_PATTERN,
+        description="Server-issued id (UUID4) from a previous response. Omit to start a new conversation.",
     )
 
 

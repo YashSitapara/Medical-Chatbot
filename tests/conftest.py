@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import os
 import time
+import uuid
 
 # Tests must not depend on the developer's local .env (e.g. MEMORY_BACKEND=redis) or shell.
 # Settings are read at import time, so set safe values before importing the app.
@@ -22,6 +23,14 @@ Settings.model_config["env_file"] = None  # never read .env during tests
 from app.main import create_app
 from app.memory import InMemoryChatMemory
 from app.rag import RAGService
+
+# Session ids must be server-issued UUID4s (app.schemas.SESSION_ID_PATTERN).
+SID = "3f2b8c1e-9d4a-4b6e-8f10-2a7c5e9d1b34"
+
+
+def new_sid() -> str:
+    return str(uuid.uuid4())
+
 
 DOCS = [
     (Document(page_content="Acne is a common skin disease.", metadata={"source": "Medical_book.pdf", "page": 12.0}), 0.91),

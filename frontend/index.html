@@ -366,7 +366,8 @@
     if (!sessionId) return;
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
-      if (res.status === 404) { sessionId = null; storage.clear(); return; }
+      // 404: expired. 422: an old, non-UUID id from before session ids were validated.
+      if (res.status === 404 || res.status === 422) { sessionId = null; storage.clear(); return; }
       if (!res.ok) return;
       const data = await res.json();
       for (const m of data.messages) {

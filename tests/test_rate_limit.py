@@ -14,7 +14,7 @@ from app.main import create_app
 from app.memory import InMemoryChatMemory
 from app.rag import RAGService
 from app.rate_limit import InMemoryRateLimiter, RedisRateLimiter, build_rate_limiter
-from tests.conftest import StubVectorStore
+from tests.conftest import StubVectorStore, SID, new_sid
 from tests.test_api import parse_sse
 
 WINDOW_START = 60 * 29_000_000  # an exact minute boundary
@@ -48,7 +48,7 @@ def make_client(limiter, ip=CLIENT_IP):
     return client
 
 
-def chat(client, session_id="s1", stream=False, **kw):
+def chat(client, session_id=SID, stream=False, **kw):
     body = {"message": "What is acne?", **({"session_id": session_id} if session_id else {})}
     return client.post("/api/chat/stream" if stream else "/api/chat", json=body, **kw)
 
@@ -85,7 +85,7 @@ def test_new_minute_starts_a_new_window(kind):
 
 def test_ip_cap_stops_rotating_session_ids(kind):
     client = make_client(make_limiter(kind, Clock(), per_session=10, per_ip=30))
-    codes = [chat(client, session_id=uuid.uuid4().hex).status_code for _ in range(31)]
+    codes = [chat(client, session_id=new_sid()).status_code for _ in range(31)]
     assert codes == [200] * 30 + [429]
 
 

@@ -18,7 +18,7 @@ from app.main import create_app
 from app.memory import InMemoryChatMemory
 from app.rag import RAGService, build_llm
 from app.schemas import Message
-from tests.conftest import DOCS, StubVectorStore
+from tests.conftest import DOCS, StubVectorStore, SID, new_sid
 from tests.test_api import parse_sse
 
 
@@ -132,8 +132,8 @@ def test_pronoun_followup_with_failed_rewrite_uses_combined_search():
     llm = ScriptedLLM(responses=["Teenagers [1]."], fail_calls=1, error=ValueError("model crashed"))
     results = {"Who usually gets it?": VAGUE, "What is acne? Who usually gets it?": ACNE}
     client, _, store, memory = make(llm=llm, results=results)
-    asyncio.run(memory.append("s", "What is acne?", "Acne is a skin disease [1]."))
-    r = client.post("/api/chat", json={"message": "Who usually gets it?", "session_id": "s"})
+    asyncio.run(memory.append(SID, "What is acne?", "Acne is a skin disease [1]."))
+    r = client.post("/api/chat", json={"message": "Who usually gets it?", "session_id": SID})
     assert r.status_code == 200
     snippets = [c["snippet"] for c in r.json()["citations"]]
     assert snippets[:2] == ["Acne affects mostly teenagers.", "Acne is a skin disease."]
@@ -146,8 +146,8 @@ def test_topic_switch_with_failed_rewrite_prefers_plain_search():
         "What is diabetes? What causes migraines?": DIABETES + [(MIGRAINE[1][0], 0.55)],
     }
     client, _, _, memory = make(llm=llm, results=results)
-    asyncio.run(memory.append("s", "What is diabetes?", "Diabetes affects blood sugar [1]."))
-    citations = client.post("/api/chat", json={"message": "What causes migraines?", "session_id": "s"}).json()["citations"]
+    asyncio.run(memory.append(SID, "What is diabetes?", "Diabetes affects blood sugar [1]."))
+    citations = client.post("/api/chat", json={"message": "What causes migraines?", "session_id": SID}).json()["citations"]
     pages = [c["page"] for c in citations]
     assert pages[:2] == [30, 31]  # both migraine chunks first; no diabetes chunk outranks them
     assert [c["score"] for c in citations if c["page"] == 31] == [0.7]  # duplicate kept once, best score
@@ -160,8 +160,8 @@ def test_failed_or_timed_out_rewrite_continues_with_dual_retrieval(caplog, failu
     else:
         llm = ScriptedLLM(responses=["Teens [1]."], fail_calls=1, delay=1.0)
     client, _, store, memory = make(llm=llm, condense_timeout_seconds=0.05)
-    asyncio.run(memory.append("s", "What is acne?", "Acne [1]."))
-    r = client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"})
+    asyncio.run(memory.append(SID, "What is acne?", "Acne [1]."))
+    r = client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID})
     assert r.status_code == 200 and r.json()["answer"] == "Teens [1]."
     cond = events_named(caplog, "query_condensed")[-1]
     assert cond["condense_strategy"] == "fallback_dual"
@@ -173,8 +173,8 @@ def test_one_fallback_search_failing_still_answers():
     llm = ScriptedLLM(responses=["Teens [1]."], fail_calls=1, error=ValueError("x"))
     results = {"Who gets it?": ServiceException(status=503, reason="down"), "What is acne? Who gets it?": ACNE}
     client, _, _, memory = make(llm=llm, results=results)
-    asyncio.run(memory.append("s", "What is acne?", "Acne [1]."))
-    r = client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"})
+    asyncio.run(memory.append(SID, "What is acne?", "Acne [1]."))
+    r = client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID})
     assert r.status_code == 200 and r.json()["citations"][0]["page"] == 10
 
 
@@ -182,15 +182,15 @@ def test_both_fallback_searches_failing_is_503():
     llm = ScriptedLLM(responses=["x"], fail_calls=1, error=ValueError("x"))
     down = ServiceException(status=503, reason="down")
     client, _, _, memory = make(llm=llm, results={"Who gets it?": down, "What is acne? Who gets it?": down})
-    asyncio.run(memory.append("s", "What is acne?", "Acne [1]."))
-    assert client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"}).status_code == 503
+    asyncio.run(memory.append(SID, "What is acne?", "Acne [1]."))
+    assert client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID}).status_code == 503
 
 
 def test_previous_question_is_capped_at_300_chars():
     llm = ScriptedLLM(responses=["x"], fail_calls=1, error=ValueError("x"))
     client, _, store, memory = make(llm=llm)
-    asyncio.run(memory.append("s", "A" * 1000, "Answer [1]."))
-    client.post("/api/chat", json={"message": "Who gets it?", "session_id": "s"})
+    asyncio.run(memory.append(SID, "A" * 1000, "Answer [1]."))
+    client.post("/api/chat", json={"message": "Who gets it?", "session_id": SID})
     assert sorted(store.queries, key=len) == ["Who gets it?", "A" * 300 + " Who gets it?"]
 
 
@@ -210,14 +210,14 @@ def test_chat_over_the_cap_is_504():
 def test_stream_over_the_cap_sends_timeout_event_and_saves_nothing(caplog):
     llm = FakeListChatModel(responses=["word " * 50], sleep=0.05)  # ~5 s of tokens
     client, _, _, memory = make(llm=llm, request_timeout_seconds=0.3)
-    r = client.post("/api/chat/stream", json={"message": "What is acne?", "session_id": "s"})
+    r = client.post("/api/chat/stream", json={"message": "What is acne?", "session_id": SID})
     events = parse_sse(r.text)
     assert r.status_code == 200  # already streaming when the cap hit
     assert "token" in [e for e, _ in events]
     assert events[-1] == ("error", {"detail": "The request took too long. Please try again.",
                                     "code": "timeout", "request_id": r.headers["X-Request-ID"],
                                     "trace_id": None})  # tracing off in tests
-    assert not asyncio.run(memory.exists("s"))
+    assert not asyncio.run(memory.exists(SID))
     assert events_named(caplog, "request_finished")[-1]["outcome"] == "timeout"
 
 
@@ -268,12 +268,12 @@ class StallingStreamLLM(FakeListChatModel):
 
 def test_stream_provider_timeout_mid_stream_is_dependency_event(caplog):
     client, _, _, memory = make(llm=StallingStreamLLM(responses=["Acne is a skin disease [1]."]))
-    r = client.post("/api/chat/stream", json={"message": "What is acne?", "session_id": "s"})
+    r = client.post("/api/chat/stream", json={"message": "What is acne?", "session_id": SID})
     events = parse_sse(r.text)
     assert [e for e, _ in events].count("token") == 1
     assert events[-1][0] == "error" and events[-1][1]["code"] == "dependency_unavailable"
     assert events_named(caplog, "request_finished")[-1]["outcome"] == "dependency_unavailable"
-    assert not asyncio.run(memory.exists("s"))  # partial answer not saved
+    assert not asyncio.run(memory.exists(SID))  # partial answer not saved
 
 
 def test_stream_bug_mid_stream_is_internal_error_event():
@@ -286,7 +286,7 @@ def test_stream_bug_mid_stream_is_internal_error_event():
 
 def test_404_and_422_bodies_have_code_and_request_id():
     client, _, _, _ = make()
-    r = client.get("/api/sessions/missing/history")
+    r = client.get(f"/api/sessions/{new_sid()}/history")
     assert r.status_code == 404 and r.json()["code"] == "not_found" and r.json()["request_id"]
     r = client.post("/api/chat", json={"message": ""})
     assert r.status_code == 422 and r.json()["code"] == "validation_error" and r.json()["request_id"]

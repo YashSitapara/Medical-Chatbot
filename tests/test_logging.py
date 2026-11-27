@@ -16,7 +16,7 @@ from app.log_config import configure_logging
 from app.main import create_app
 from app.memory import InMemoryChatMemory, RedisChatMemory
 from app.rag import RAGService
-from tests.conftest import OFF_TOPIC, StubVectorStore
+from tests.conftest import OFF_TOPIC, StubVectorStore, SID, new_sid
 from tests.test_api import parse_sse
 
 QUESTION = "Jane Doe 1984 HIV status?"
@@ -102,7 +102,7 @@ def test_invalid_incoming_request_id_is_replaced(make_logged_client, bad):
 def test_request_id_on_sse_503_and_404(make_logged_client):
     client, _, _ = make_logged_client(["Acne [1]."])
     assert client.post("/api/chat/stream", json={"message": "What is acne?"}).headers.get("X-Request-ID")
-    assert client.get("/api/sessions/nope/history").headers.get("X-Request-ID")
+    assert client.get(f"/api/sessions/{new_sid()}/history").headers.get("X-Request-ID")
 
     server = fakeredis.FakeServer()
     redis_mem = RedisChatMemory(client=fakeredis.FakeAsyncRedis(server=server, decode_responses=True))
@@ -118,7 +118,7 @@ def test_request_id_on_sse_503_and_404(make_logged_client):
 def test_unhandled_exception_gets_500_with_request_id(make_logged_client):
     client, lines, _ = make_logged_client()
     client.app.state.memory = None  # breaks /api/sessions/... with an AttributeError
-    r = client.delete("/api/sessions/s1", headers={"X-Request-ID": "boom-1"})
+    r = client.delete(f"/api/sessions/{SID}", headers={"X-Request-ID": "boom-1"})
     assert r.status_code == 500
     assert r.headers["X-Request-ID"] == "boom-1" and r.json()["request_id"] == "boom-1"
     finished = [ln for ln in events(lines(), "boom-1") if ln["event"] == "request_finished"]
@@ -204,7 +204,7 @@ def test_out_of_scope_has_no_llm_done(make_logged_client):
 
 def test_route_is_template_not_raw_path(make_logged_client):
     client, lines, _ = make_logged_client()
-    client.get("/api/sessions/secret-session-xyz/history")
+    client.get(f"/api/sessions/{new_sid()}/history")
     fin = next(ln for ln in lines() if ln["event"] == "request_finished")
     assert fin["route"] == "/api/sessions/{session_id}/history" and fin["status_code"] == 404
     # A client error is not a server failure: INFO, not WARNING.
